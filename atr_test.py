@@ -1,9 +1,8 @@
 import re
 import pandas as pd
 from ib_insync import IB, Future
-from decimal import Decimal
 
-# Example function to parse a raw IBKR position line (works as you have it)
+# --- Parse IBKR portfolio line ---
 def parse_ibkr_position(raw_line):
     try:
         _, rest = raw_line.split(":", 1)
@@ -17,20 +16,31 @@ def parse_ibkr_position(raw_line):
     except Exception:
         return "N/A", 0.0, 0.0
 
-# Function to calculate ATR from a pandas DataFrame of OHLC
-def calculate_atr(df, period=14):
-    df['H-L'] = df['high'] - df['low']
-    df['H-C'] = abs(df['high'] - df['close'].shift(1))
-    df['L-C'] = abs(df['low'] - df['close'].shift(1))
-    df['TR'] = df[['H-L', 'H-C', 'L-C']].max(axis=1)
-    df['ATR'] = df['TR'].rolling(period).mean()
-    return df['ATR'].iloc[-1]  # Return the most recent ATR value
+# --- Calculate TR and ATR using prior ATR ---
+def calculate_tr_and_atr(df, prior_atr=7.25):
+    if len(df) < 2:
+        return None, None
 
-# Connect to IB
+    prev_close = df['close'].iloc[-2]
+    current_high = df['high'].iloc[-1]
+    current_low = df['low'].iloc[-1]
+
+    # True Range
+    tr1 = current_high - current_low
+    tr2 = abs(current_high - prev_close)
+    tr3 = abs(current_low - prev_close)
+    current_tr = max(tr1, tr2, tr3)
+
+    # ATR with prior ATR
+    current_atr = (prior_atr * 13 + current_tr) / 14
+
+    return current_tr, current_atr
+
+# --- Connect to IBKR ---
 ib = IB()
-ib.connect('127.0.0.1', 7496, clientId=1)  # Adjust port/clientId if needed
+ib.connect('127.0.0.1', 7497, clientId=1)
 
-# Example: take raw portfolio lines
+# --- Example portfolio lines ---
 raw_positions = [
     "DUO883664: MES | 1.0 | Avg Cost: 34398.12",
     "XYZ123456: MZL | 2.0 | Avg Cost: 700.50"
@@ -41,25 +51,24 @@ for line in raw_positions:
     if symbol == "N/A":
         continue
 
-    # Define the futures contract (example: MES future)
+    # Define contract
     contract = Future(symbol=symbol, lastTradeDateOrContractMonth='20251219', exchange='CME', currency='USD')
 
-    # Request historical data (1 month daily bars)
+    # Get historical bars (at least 2 days)
     bars = ib.reqHistoricalData(
         contract,
         endDateTime='',
-        durationStr='1 M',
+        durationStr='3 D',  # enough for previous + current bar
         barSizeSetting='1 day',
         whatToShow='TRADES',
         useRTH=True,
         formatDate=1
     )
 
-    if not bars:
-        print(f"No historical data for {symbol}")
+    if not bars or len(bars) < 2:
+        print(f"Not enough historical data for {symbol}")
         continue
 
-    # Convert to DataFrame for ATR calculation
     df = pd.DataFrame([{
         'open': b.open,
         'high': b.high,
@@ -68,5 +77,5 @@ for line in raw_positions:
         'volume': b.volume
     } for b in bars])
 
-    atr_value = calculate_atr(df)
-    print(f"Symbol: {symbol}, ATR: {atr_value:.2f}")
+    tr, atr = calculate_tr_and_atr(df, prior_atr=7.25)
+    print(f"Symbol: {symbol}, Current TR: {tr:.2f}, ATR(14) with prior 7.25: {atr:.2f}")

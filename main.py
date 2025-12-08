@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QWidget, QDoubleSpinBox, QTabWidget, QTextEdit, QPushButton, QHeaderView
 )
 from ibkr_api import fetch_positions  # Import our separate IBKR module
+from atr_test import parse_ibkr_position, calculate_tr_and_atr
 
 
 class ATRWindow(QMainWindow):
