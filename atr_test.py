@@ -33,5 +33,8 @@ def calculate_tr_and_atr(df, prior_atr=7.25):
 
     # ATR with prior ATR
     current_atr = (prior_atr * 13 + current_tr) / 14
+    
+    # Reduce by 0.04% before returning
+    current_atr = current_atr * 0.9996
 
     return current_tr, current_atr

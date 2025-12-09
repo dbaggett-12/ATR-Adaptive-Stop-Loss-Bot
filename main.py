@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from ibkr_api import fetch_positions  # Import our separate IBKR module
 from atr_test import parse_ibkr_position, calculate_tr_and_atr
-from ib_insync import IB, Future
+from ib_insync import IB, Future, Stock, Contract
 import pandas as pd
 
 
@@ -26,16 +26,15 @@ class ATRWindow(QMainWindow):
 
         # Placeholder data lists
         self.positions = []
-        self.market_prices = []
-        self.pl_values = []
         self.atr_values = []
         self.atr_ratios = []
         self.statuses = []
         self.symbols = []
         self.positions_held = []
-        self.avg_costs = []
         self.current_prices = []
-        self.monthly_pl_percent = []
+        self.computed_stop_losses = []  # Current computed stop losses
+        self.highest_stop_losses = {}  # Track highest stop loss per symbol (never goes down)
+        self.contract_details_map = {}  # Store contract details by symbol
         
         # ATR calculation data
         self.atr_symbols = []
@@ -66,37 +65,18 @@ class ATRWindow(QMainWindow):
         
         # Adaptive Stop Loss Toggle (Left side)
         toggle_container = QWidget()
-        toggle_layout = QVBoxLayout()
+        toggle_layout = QHBoxLayout()
         toggle_container.setLayout(toggle_layout)
         toggle_layout.setContentsMargins(0, 0, 0, 0)
         
-        toggle_label = QLabel("Send Adaptive Stop Losses")
-        toggle_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        toggle_label = QLabel("Send Adaptive Stop Losses:")
+        toggle_label.setStyleSheet("font-weight: bold;")
         toggle_layout.addWidget(toggle_label)
         
         self.adaptive_stop_toggle = QCheckBox()
         self.adaptive_stop_toggle.setChecked(False)
         self.adaptive_stop_toggle.stateChanged.connect(self.on_adaptive_stop_toggled)
-        # Style the checkbox as a toggle switch
-        self.adaptive_stop_toggle.setStyleSheet("""
-            QCheckBox {
-                spacing: 0px;
-            }
-            QCheckBox::indicator {
-                width: 50px;
-                height: 25px;
-                border-radius: 12px;
-                background-color: #d32f2f;
-                border: 2px solid #b71c1c;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #4caf50;
-                border: 2px solid #388e3c;
-            }
-            QCheckBox::indicator:hover {
-                border: 2px solid #555;
-            }
-        """)
+        self.adaptive_stop_toggle.setText("OFF")
         toggle_layout.addWidget(self.adaptive_stop_toggle)
         
         status_layout.addWidget(toggle_container)
@@ -135,10 +115,10 @@ class ATRWindow(QMainWindow):
         self.tabs.addTab(self.positions_tab, "Positions")
 
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels([
-            "Position", "Market Price", "ATR", "ATR Ratio", "Status",
-            "Positions Held", "Avg Cost", "Current Price", "Monthly P/L %"
+            "Position", "ATR", "ATR Ratio", "Status",
+            "Positions Held", "Current Price", "Computed Stop Loss"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionsMovable(True)
@@ -181,36 +161,66 @@ class ATRWindow(QMainWindow):
     def populate_positions_table(self):
         self.table.setRowCount(len(self.positions))
         for i, pos in enumerate(self.positions):
-            self.table.setItem(i, 0, QTableWidgetItem(pos))
-            self.table.setItem(i, 1, QTableWidgetItem(str(self.market_prices[i])))
-            
-            # Get ATR value from ATR calculations tab
             symbol = self.symbols[i]
+            
+            # Column 0: Position
+            self.table.setItem(i, 0, QTableWidgetItem(pos))
+            
+            # Column 1: ATR - Get ATR value from ATR calculations tab
+            atr_value = None
             atr_display = "N/A"
             if symbol in self.atr_symbols:
                 atr_index = self.atr_symbols.index(symbol)
                 if self.atr_calculated[atr_index] is not None:
-                    atr_display = f"{self.atr_calculated[atr_index]:.2f}"
-            self.table.setItem(i, 2, QTableWidgetItem(atr_display))
+                    atr_value = self.atr_calculated[atr_index]
+                    atr_display = f"{atr_value:.2f}"
+            self.table.setItem(i, 1, QTableWidgetItem(atr_display))
 
-            # ATR Ratio editable spin box
+            # Column 2: ATR Ratio editable spin box
             spin = QDoubleSpinBox()
             spin.setMinimum(0.0)
+            spin.setMaximum(10.0)
+            spin.setSingleStep(0.1)
+            spin.setDecimals(1)
             spin.setValue(self.atr_ratios[i])
             spin.valueChanged.connect(lambda val, row=i: self.update_atr_ratio(row, val))
-            self.table.setCellWidget(i, 3, spin)
+            self.table.setCellWidget(i, 2, spin)
 
-            self.table.setItem(i, 4, QTableWidgetItem(self.statuses[i]))
-            self.table.setItem(i, 5, QTableWidgetItem(str(self.positions_held[i])))
-            self.table.setItem(i, 6, QTableWidgetItem(f"{self.avg_costs[i]:.2f}"))
-            self.table.setItem(i, 7, QTableWidgetItem(f"{self.current_prices[i]:.2f}"))
+            # Column 3: Status
+            self.table.setItem(i, 3, QTableWidgetItem(self.statuses[i]))
+            
+            # Column 4: Positions Held
+            self.table.setItem(i, 4, QTableWidgetItem(str(self.positions_held[i])))
+            
+            # Column 5: Current Price
+            self.table.setItem(i, 5, QTableWidgetItem(f"{self.current_prices[i]:.2f}"))
 
-            pl_item = QTableWidgetItem(f"{self.monthly_pl_percent[i]:.2f}%")
-            if self.monthly_pl_percent[i] >= 0:
-                pl_item.setForeground(QtGui.QColor("green"))
-            else:
-                pl_item.setForeground(QtGui.QColor("red"))
-            self.table.setItem(i, 8, pl_item)
+            # Column 6: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
+            # Stop loss never goes down - use highest computed value
+            computed_stop = self.compute_stop_loss(symbol, self.current_prices[i], atr_value, self.atr_ratios[i])
+            stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
+            self.table.setItem(i, 6, stop_item)
+    
+    def compute_stop_loss(self, symbol, current_price, atr_value, atr_ratio):
+        """
+        Compute stop loss = Current Price - (ATR × ATR Ratio)
+        Stop loss never goes down - track highest value per symbol
+        """
+        if atr_value is None or current_price <= 0:
+            return self.highest_stop_losses.get(symbol, 0)
+        
+        # Calculate new stop loss
+        new_stop = current_price - (atr_value * atr_ratio)
+        
+        # Get previous highest stop loss for this symbol
+        prev_highest = self.highest_stop_losses.get(symbol, 0)
+        
+        # Stop loss never goes down - use max of new and previous
+        if new_stop > prev_highest:
+            self.highest_stop_losses[symbol] = new_stop
+            return new_stop
+        else:
+            return prev_highest
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
@@ -343,7 +353,26 @@ class ATRWindow(QMainWindow):
         try:
             ib.connect('127.0.0.1', 7497, clientId=random.randint(100, 999))
             
-            contract = Future(symbol=symbol, lastTradeDateOrContractMonth='20251219', exchange='CME', currency='USD')
+            # Get contract details from position data if available
+            contract_info = self.contract_details_map.get(symbol, {})
+            
+            # Create contract using actual details from position
+            if contract_info.get('conId'):
+                # Use conId for most accurate contract identification
+                contract = Contract(conId=contract_info['conId'])
+                ib.qualifyContracts(contract)
+            elif contract_info.get('lastTradeDateOrContractMonth'):
+                # Use actual expiration date from position
+                contract = Future(
+                    symbol=symbol,
+                    lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
+                    exchange=contract_info.get('exchange', 'CME'),
+                    currency=contract_info.get('currency', 'USD')
+                )
+                ib.qualifyContracts(contract)
+            else:
+                print(f"No contract details available for {symbol}")
+                return
             
             bars = ib.reqHistoricalData(
                 contract,
@@ -393,11 +422,18 @@ class ATRWindow(QMainWindow):
     def on_adaptive_stop_toggled(self, state):
         """Handle adaptive stop loss toggle change"""
         self.send_adaptive_stops = self.adaptive_stop_toggle.isChecked()
+        # Update checkbox text
+        if self.send_adaptive_stops:
+            self.adaptive_stop_toggle.setText("ON")
+        else:
+            self.adaptive_stop_toggle.setText("OFF")
         status_text = "ENABLED" if self.send_adaptive_stops else "DISABLED"
         print(f"Adaptive Stop Losses: {status_text}")
 
     def update_atr_ratio(self, row, value):
         self.atr_ratios[row] = value
+        # Recalculate and update stop loss when ratio changes
+        self.populate_positions_table()
 
     def update_status(self, connected):
         """Update the connection status display"""
@@ -430,8 +466,35 @@ class ATRWindow(QMainWindow):
                     # Get previous ATR from history
                     previous_atr = self.get_previous_atr(symbol)
                     
-                    # Define contract
-                    contract = Future(symbol=symbol, lastTradeDateOrContractMonth='20251219', exchange='CME', currency='USD')
+                    # Get contract details from position data if available
+                    contract_info = self.contract_details_map.get(symbol, {})
+                    sec_type = contract_info.get('secType', 'FUT')
+                    
+                    # Skip stocks/ETFs for ATR calculation (they use different method)
+                    if sec_type == 'STK':
+                        print(f"Skipping {symbol} - Stock/ETF (ATR calculation not applicable)")
+                        continue
+                    
+                    # Create contract using actual details from position
+                    if contract_info.get('conId'):
+                        # Use conId for most accurate contract identification
+                        contract = Contract(conId=contract_info['conId'])
+                        ib.qualifyContracts(contract)
+                        print(f"Using conId {contract_info['conId']} for {symbol}")
+                    elif contract_info.get('lastTradeDateOrContractMonth'):
+                        # Use actual expiration date from position
+                        contract = Future(
+                            symbol=symbol,
+                            lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
+                            exchange=contract_info.get('exchange', 'CME'),
+                            currency=contract_info.get('currency', 'USD')
+                        )
+                        ib.qualifyContracts(contract)
+                        print(f"Using expiration {contract_info['lastTradeDateOrContractMonth']} for {symbol}")
+                    else:
+                        # Fallback - skip if we don't have contract details
+                        print(f"No contract details available for {symbol}, skipping ATR calculation")
+                        continue
                     
                     # Get historical bars (14 days for ATR calculation)
                     bars = ib.reqHistoricalData(
@@ -516,33 +579,33 @@ class ATRWindow(QMainWindow):
                 self.raw_data_view.setPlainText("No positions returned from IBKR")
                 return
 
-            # Clear old data
+            # Clear old data (but preserve highest_stop_losses - they never reset)
             self.positions.clear()
-            self.market_prices.clear()
-            self.pl_values.clear()
             self.atr_values.clear()
             self.atr_ratios.clear()
             self.statuses.clear()
             self.symbols.clear()
             self.positions_held.clear()
-            self.avg_costs.clear()
             self.current_prices.clear()
-            self.monthly_pl_percent.clear()
+            self.computed_stop_losses.clear()
 
             display_text = ""
+            self.contract_details_map.clear()
             for p in positions_data:
                 self.positions.append(p['position'])
-                self.market_prices.append(0)
-                self.pl_values.append(0)
                 self.atr_values.append(0)
-                self.atr_ratios.append(1.0)
+                self.atr_ratios.append(2.5)  # Default ATR Ratio is now 2.5
                 self.statuses.append("Up to date")
                 self.symbols.append(p['symbol'])
                 self.positions_held.append(p['positions_held'])
-                self.avg_costs.append(p['avg_cost'])
                 self.current_prices.append(p['current_price'])
-                self.monthly_pl_percent.append(p['monthly_pl_percent'])
-                display_text += p['raw_line'] + "\n"
+                self.computed_stop_losses.append(0)
+                # Store contract details for ATR calculations
+                if 'contract_details' in p:
+                    self.contract_details_map[p['symbol']] = p['contract_details']
+                # Build raw line for display
+                raw_line = f"{p['symbol']} | Qty: {p['positions_held']} | Avg Cost: ${p['avg_cost']:.2f} | Price: ${p['current_price']:.2f} | P/L: ${p.get('unrealized_pl', 0):.2f} ({p.get('pl_percent', 0):.2f}%)"
+                display_text += raw_line + "\n"
 
             self.raw_data_view.setPlainText(display_text)
             self.populate_positions_table()
@@ -561,6 +624,12 @@ if __name__ == "__main__":
     window = ATRWindow()
     window.show()
     sys.exit(app.exec())
+
+
+
+
+
+
 
 
 

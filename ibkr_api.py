@@ -1,20 +1,7 @@
-from ib_insync import IB
+from ib_insync import IB, util
 from time import sleep
-import re
 import random
-
-def parse_ibkr_position(raw_line):
-    try:
-        _, rest = raw_line.split(":", 1)
-        symbol_match = re.match(r"\s*(\w+)\s*\|", rest)
-        symbol = symbol_match.group(1) if symbol_match else "N/A"
-        pos_match = re.search(r"\|\s*([\d\.]+)\s*\|", rest)
-        positions_held = float(pos_match.group(1)) if pos_match else 0.0
-        cost_match = re.search(r"Avg Cost:\s*([\d\.]+)", rest)
-        avg_cost = float(cost_match.group(1)) if cost_match else 0.0
-        return symbol, positions_held, avg_cost
-    except Exception:
-        return "N/A", 0.0, 0.0
+import math
 
 
 def fetch_positions():
@@ -38,24 +25,115 @@ def fetch_positions():
             print(f"Successfully connected with clientId {client_id}")
             
             positions = ib.positions()
+            
+            # Qualify contracts first to fill in missing details like exchange
+            contracts = [pos.contract for pos in positions]
+            ib.qualifyContracts(*contracts)
+            
+            # Request delayed market data (type 3) if live data is not available
+            # Type 1 = Live, Type 2 = Frozen, Type 3 = Delayed, Type 4 = Delayed-Frozen
+            ib.reqMarketDataType(3)
+            
+            # Request market data for all positions
+            tickers = {}
             for pos in positions:
-                raw_line = f"{pos.account}: {pos.contract.symbol} | {pos.position} | Avg Cost: {pos.avgCost}"
-                symbol, held, avg = parse_ibkr_position(raw_line)
+                try:
+                    ticker = ib.reqMktData(pos.contract, "", False, False)
+                    tickers[pos.contract.symbol] = (pos, ticker)
+                except Exception as e:
+                    print(f"Warning: Could not request market data for {pos.contract.symbol}: {e}")
+                    tickers[pos.contract.symbol] = (pos, None)
+            
+            # Wait for market data to populate (up to 2 seconds)
+            ib.sleep(2)
+            
+            for symbol, (pos, ticker) in tickers.items():
+                # Get values directly from IBKR position object
+                positions_held = float(pos.position)
+                raw_avg_cost = float(pos.avgCost)
+                
+                # Get security type and multiplier
+                sec_type = pos.contract.secType if hasattr(pos.contract, 'secType') else 'STK'
+                
+                # Get contract multiplier (for futures, this is the contract size)
+                multiplier = 1.0
+                if hasattr(pos.contract, 'multiplier') and pos.contract.multiplier:
+                    try:
+                        multiplier = float(pos.contract.multiplier)
+                    except (ValueError, TypeError):
+                        multiplier = 1.0
+                
+                # Handle avgCost based on security type
+                # For FUTURES (FUT): IBKR's avgCost includes the multiplier, so divide to get entry price
+                # For STOCKS (STK) and ETFs: avgCost IS the actual entry price, don't divide
+                if sec_type == 'FUT' and multiplier > 1:
+                    avg_cost = raw_avg_cost / multiplier
+                else:
+                    avg_cost = raw_avg_cost
+                
+                print(f"DEBUG {symbol}: secType={sec_type}, raw_avgCost={raw_avg_cost}, multiplier={multiplier}, avg_cost={avg_cost}")
 
-                ticker = ib.reqMktData(pos.contract, "", False, False)
-                sleep(0.1)
-                current_price = ticker.last if ticker.last else 0.0
-                monthly_pl_pct = ((current_price - avg) / avg) * 100 if avg != 0 else 0.0
+                # Try to get the best available price
+                current_price = 0.0
+                
+                if ticker is not None:
+                    # Check last price first
+                    if ticker.last and not math.isnan(ticker.last) and ticker.last > 0:
+                        current_price = ticker.last
+                    # Fall back to close price
+                    elif ticker.close and not math.isnan(ticker.close) and ticker.close > 0:
+                        current_price = ticker.close
+                    # Fall back to bid/ask midpoint
+                    elif ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+                        current_price = (ticker.bid + ticker.ask) / 2
+                    # Last resort: use market price from ticker
+                    elif ticker.marketPrice() and not math.isnan(ticker.marketPrice()):
+                        current_price = ticker.marketPrice()
 
+                # Calculate market values and P/L
+                # For futures: cost_basis and market_value should include multiplier
+                cost_basis = avg_cost * multiplier * abs(positions_held)
+                market_value = current_price * multiplier * abs(positions_held)
+                
+                # P/L calculation (handles both long and short positions)
+                if positions_held > 0:  # Long position
+                    unrealized_pl = market_value - cost_basis
+                else:  # Short position
+                    unrealized_pl = cost_basis - market_value
+                
+                # P/L percentage based on cost basis
+                pl_percent = (unrealized_pl / cost_basis) * 100 if cost_basis != 0 else 0.0
+
+                # Store contract details for ATR calculations
+                contract_details = {
+                    'secType': sec_type,
+                    'exchange': pos.contract.exchange if hasattr(pos.contract, 'exchange') else '',
+                    'currency': pos.contract.currency if hasattr(pos.contract, 'currency') else 'USD',
+                    'lastTradeDateOrContractMonth': pos.contract.lastTradeDateOrContractMonth if hasattr(pos.contract, 'lastTradeDateOrContractMonth') else '',
+                    'conId': pos.contract.conId if hasattr(pos.contract, 'conId') else 0,
+                }
+                
                 results.append({
                     'position': pos.contract.symbol,
                     'symbol': symbol,
-                    'positions_held': held,
-                    'avg_cost': avg,
+                    'positions_held': positions_held,
+                    'avg_cost': avg_cost,  # This is now the actual entry price
                     'current_price': current_price,
-                    'monthly_pl_percent': monthly_pl_pct,
-                    'raw_line': raw_line
+                    'multiplier': multiplier,
+                    'cost_basis': cost_basis,
+                    'market_value': market_value,
+                    'unrealized_pl': unrealized_pl,
+                    'pl_percent': pl_percent,
+                    'contract_details': contract_details
                 })
+            
+            # Cancel market data subscriptions
+            for symbol, (pos, ticker) in tickers.items():
+                if ticker is not None:
+                    try:
+                        ib.cancelMktData(pos.contract)
+                    except Exception:
+                        pass
             connection_success = True
             break  # Success, exit the retry loop
             
