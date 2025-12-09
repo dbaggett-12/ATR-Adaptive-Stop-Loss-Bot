@@ -1,6 +1,7 @@
 from ib_insync import IB
 from time import sleep
 import re
+import random
 
 def parse_ibkr_position(raw_line):
     try:
@@ -18,45 +19,66 @@ def parse_ibkr_position(raw_line):
 
 def fetch_positions():
     """
-    Connects to IBKR and returns a list of dicts:
-    [
-        {
-            'position': 'MES',
-            'symbol': 'MES',
-            'positions_held': 1.0,
-            'avg_cost': 34398.12,
-            'current_price': 34400.0,
-            'monthly_pl_percent': 0.06,
-            'raw_line': '...'
-        }, ...
-    ]
+    Connects to IBKR and returns a tuple: (results_list, connection_success)
+    results_list: list of dicts with position data
+    connection_success: True if successfully connected and retrieved data, False otherwise
     """
     ib = IB()
     results = []
+    connection_success = False
+    
+    # Try multiple clientIds in case one is still in use
+    max_retries = 5
+    for attempt in range(max_retries):
+        client_id = random.randint(100, 999)
+        
+        try:
+            print(f"Attempting to connect with clientId {client_id}...")
+            ib.connect('127.0.0.1', 7497, clientId=client_id)
+            print(f"Successfully connected with clientId {client_id}")
+            
+            positions = ib.positions()
+            for pos in positions:
+                raw_line = f"{pos.account}: {pos.contract.symbol} | {pos.position} | Avg Cost: {pos.avgCost}"
+                symbol, held, avg = parse_ibkr_position(raw_line)
 
-    try:
-        ib.connect('127.0.0.1', 7497, clientId=1)
-        positions = ib.positions()
-        for pos in positions:
-            raw_line = f"{pos.account}: {pos.contract.symbol} | {pos.position} | Avg Cost: {pos.avgCost}"
-            symbol, held, avg = parse_ibkr_position(raw_line)
+                ticker = ib.reqMktData(pos.contract, "", False, False)
+                sleep(0.1)
+                current_price = ticker.last if ticker.last else 0.0
+                monthly_pl_pct = ((current_price - avg) / avg) * 100 if avg != 0 else 0.0
 
-            ticker = ib.reqMktData(pos.contract, "", False, False)
-            sleep(0.1)
-            current_price = ticker.last if ticker.last else 0.0
-            monthly_pl_pct = ((current_price - avg) / avg) * 100 if avg != 0 else 0.0
+                results.append({
+                    'position': pos.contract.symbol,
+                    'symbol': symbol,
+                    'positions_held': held,
+                    'avg_cost': avg,
+                    'current_price': current_price,
+                    'monthly_pl_percent': monthly_pl_pct,
+                    'raw_line': raw_line
+                })
+            connection_success = True
+            break  # Success, exit the retry loop
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Attempt {attempt + 1} failed with clientId {client_id}: {error_msg}")
+            
+            # Check if it's a clientId error
+            if "client id" in error_msg.lower() or "clientid" in error_msg.lower():
+                if attempt < max_retries - 1:
+                    print("ClientId conflict detected, retrying with a different clientId...")
+                    sleep(0.5)  # Brief pause before retry
+                    continue
+                else:
+                    print("Max retries reached. Unable to connect.")
+            else:
+                # For non-clientId errors, don't retry
+                print(f"Error connecting to IBKR: {e}")
+                break
+                
+        finally:
+            # Always disconnect, even if there was an error
+            if ib.isConnected():
+                ib.disconnect()
 
-            results.append({
-                'position': pos.contract.symbol,
-                'symbol': symbol,
-                'positions_held': held,
-                'avg_cost': avg,
-                'current_price': current_price,
-                'monthly_pl_percent': monthly_pl_pct,
-                'raw_line': raw_line
-            })
-        ib.disconnect()
-    except Exception as e:
-        print(f"Error connecting to IBKR: {e}")
-
-    return results
+    return results, connection_success
