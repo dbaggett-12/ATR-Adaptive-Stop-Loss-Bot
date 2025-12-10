@@ -1,4 +1,4 @@
-from ib_insync import IB, util
+from ib_insync import IB, util, Contract, StopOrder
 from time import sleep
 import random
 import math
@@ -160,3 +160,197 @@ def fetch_positions():
                 ib.disconnect()
 
     return results, connection_success
+
+
+def submit_stop_loss_orders(stop_loss_data):
+    """
+    Submit stop loss orders for each symbol in stop_loss_data.
+    Cancels any existing orders for each symbol before submitting new stop loss.
+    
+    Args:
+        stop_loss_data: dict mapping symbol to dict with:
+            - 'stop_price': the stop loss price
+            - 'quantity': number of contracts/shares (positive for long, negative for short)
+            - 'contract_details': dict with conId, secType, exchange, currency, lastTradeDateOrContractMonth
+    
+    Returns:
+        tuple: (results_list, success)
+        results_list: list of dicts with order submission results
+        success: True if all orders submitted successfully
+    """
+    ib = IB()
+    results = []
+    success = False
+    
+    if not stop_loss_data:
+        print("No stop loss data provided")
+        return results, False
+    
+    max_retries = 5
+    for attempt in range(max_retries):
+        client_id = random.randint(100, 999)
+        
+        try:
+            print(f"Attempting to connect with clientId {client_id} for stop loss orders...")
+            ib.connect('127.0.0.1', 7497, clientId=client_id)
+            print(f"Successfully connected with clientId {client_id}")
+            
+            # Get all open orders
+            open_orders = ib.openOrders()
+            print(f"Found {len(open_orders)} open orders")
+            
+            for symbol, data in stop_loss_data.items():
+                try:
+                    stop_price = data.get('stop_price', 0)
+                    quantity = data.get('quantity', 0)
+                    contract_details = data.get('contract_details', {})
+                    
+                    if stop_price <= 0:
+                        print(f"Skipping {symbol}: Invalid stop price {stop_price}")
+                        results.append({
+                            'symbol': symbol,
+                            'status': 'skipped',
+                            'message': f'Invalid stop price: {stop_price}'
+                        })
+                        continue
+                    
+                    if quantity == 0:
+                        print(f"Skipping {symbol}: No position quantity")
+                        results.append({
+                            'symbol': symbol,
+                            'status': 'skipped',
+                            'message': 'No position quantity'
+                        })
+                        continue
+                    
+                    # Create contract from details
+                    con_id = contract_details.get('conId', 0)
+                    if con_id:
+                        contract = Contract(conId=con_id)
+                        ib.qualifyContracts(contract)
+                        print(f"Using conId {con_id} for {symbol}")
+                    else:
+                        print(f"Skipping {symbol}: No conId available")
+                        results.append({
+                            'symbol': symbol,
+                            'status': 'skipped',
+                            'message': 'No contract ID available'
+                        })
+                        continue
+                    
+                    # Cancel existing orders for this symbol
+                    cancelled_count = 0
+                    for trade in ib.openTrades():
+                        if trade.contract.symbol == symbol:
+                            print(f"Cancelling existing order for {symbol}: {trade.order.orderId}")
+                            ib.cancelOrder(trade.order)
+                            cancelled_count += 1
+                    
+                    if cancelled_count > 0:
+                        print(f"Cancelled {cancelled_count} existing order(s) for {symbol}")
+                        ib.sleep(0.5)  # Wait for cancellations to process
+                    
+                    # Determine order action based on position
+                    # For long positions (quantity > 0), we SELL to close
+                    # For short positions (quantity < 0), we BUY to close
+                    if quantity > 0:
+                        action = 'SELL'
+                        order_quantity = abs(quantity)
+                    else:
+                        action = 'BUY'
+                        order_quantity = abs(quantity)
+                    
+                    # Create stop loss order
+                    stop_order = StopOrder(
+                        action=action,
+                        totalQuantity=order_quantity,
+                        stopPrice=round(stop_price, 2),
+                        tif='GTC'  # Good Till Cancelled
+                    )
+                    
+                    print(f"Submitting {action} STOP order for {symbol}: {order_quantity} @ {stop_price:.2f}")
+                    
+                    # Place the order using EClient.placeOrder (via ib_insync wrapper)
+                    trade = ib.placeOrder(contract, stop_order)
+                    
+                    # Wait for order to reach PendingSubmit or better status
+                    # Valid statuses: PendingSubmit, PreSubmitted, Submitted, Filled
+                    valid_statuses = ['PendingSubmit', 'PreSubmitted', 'Submitted', 'Filled', 'ApiPending']
+                    max_wait = 10  # Maximum wait time in seconds
+                    wait_interval = 0.5
+                    waited = 0
+                    
+                    while waited < max_wait:
+                        ib.sleep(wait_interval)
+                        waited += wait_interval
+                        order_status = trade.orderStatus.status if trade.orderStatus else ''
+                        print(f"  {symbol} order status: {order_status} (waited {waited:.1f}s)")
+                        
+                        if order_status in valid_statuses:
+                            print(f"  Order for {symbol} reached {order_status} - pushing to IBKR")
+                            break
+                        elif order_status in ['Cancelled', 'ApiCancelled', 'Inactive']:
+                            print(f"  Order for {symbol} was rejected: {order_status}")
+                            break
+                    
+                    # Final status check
+                    final_status = trade.orderStatus.status if trade.orderStatus else 'Unknown'
+                    order_pushed = final_status in valid_statuses
+                    
+                    if order_pushed:
+                        print(f"SUCCESS: {symbol} STOP order pushed to IBKR - Status: {final_status}, OrderId: {trade.order.orderId}")
+                        results.append({
+                            'symbol': symbol,
+                            'status': 'submitted',
+                            'order_id': trade.order.orderId,
+                            'action': action,
+                            'quantity': order_quantity,
+                            'stop_price': stop_price,
+                            'order_status': final_status,
+                            'cancelled_orders': cancelled_count
+                        })
+                    else:
+                        print(f"WARNING: {symbol} order may not have been accepted - Status: {final_status}")
+                        results.append({
+                            'symbol': symbol,
+                            'status': 'pending',
+                            'order_id': trade.order.orderId if trade.order else 0,
+                            'action': action,
+                            'quantity': order_quantity,
+                            'stop_price': stop_price,
+                            'order_status': final_status,
+                            'cancelled_orders': cancelled_count,
+                            'message': f'Order status: {final_status}'
+                        })
+                    
+                except Exception as e:
+                    print(f"Error processing stop loss for {symbol}: {e}")
+                    results.append({
+                        'symbol': symbol,
+                        'status': 'error',
+                        'message': str(e)
+                    })
+            
+            success = True
+            break  # Success, exit retry loop
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Attempt {attempt + 1} failed with clientId {client_id}: {error_msg}")
+            
+            if "client id" in error_msg.lower() or "clientid" in error_msg.lower():
+                if attempt < max_retries - 1:
+                    print("ClientId conflict detected, retrying with a different clientId...")
+                    sleep(0.5)
+                    continue
+                else:
+                    print("Max retries reached. Unable to connect.")
+            else:
+                print(f"Error connecting to IBKR: {e}")
+                break
+                
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+    
+    return results, success

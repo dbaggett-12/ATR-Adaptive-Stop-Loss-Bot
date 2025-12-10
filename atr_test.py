@@ -16,25 +16,24 @@ def parse_ibkr_position(raw_line):
     except Exception:
         return "N/A", 0.0, 0.0
 
-# --- Calculate TR and ATR using prior ATR ---
-def calculate_tr_and_atr(df, prior_atr=7.25):
+# --- Calculate TR and ATR using stored prior ATR from previous interval ---
+def calculate_tr_and_atr(df, prior_atr):
     if len(df) < 2:
         return None, None
 
+    # Calculate current TR
     prev_close = df['close'].iloc[-2]
     current_high = df['high'].iloc[-1]
     current_low = df['low'].iloc[-1]
 
-    # True Range
+    # True Range (current)
     tr1 = current_high - current_low
     tr2 = abs(current_high - prev_close)
     tr3 = abs(current_low - prev_close)
     current_tr = max(tr1, tr2, tr3)
 
-    # ATR with prior ATR
+    # ATR using the calculated prior ATR from previous 15-minute interval
+    # Formula: ATR = (Prior ATR × 13 + Current TR) / 14
     current_atr = (prior_atr * 13 + current_tr) / 14
-    
-    # Reduce by 0.04% before returning
-    current_atr = current_atr * 0.9996
 
     return current_tr, current_atr

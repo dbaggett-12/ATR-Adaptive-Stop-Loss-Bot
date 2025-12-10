@@ -1,9 +1,10 @@
 # main.py
 import sys
+import logging
 import random
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from PyQt6 import QtGui
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -11,10 +12,15 @@ from PyQt6.QtWidgets import (
     QLabel, QHBoxLayout, QCheckBox
 )
 from PyQt6.QtCore import Qt, QTimer
-from ibkr_api import fetch_positions  # Import our separate IBKR module
-from atr_test import parse_ibkr_position, calculate_tr_and_atr
+from ibkr_api import fetch_positions, submit_stop_loss_orders  # Import our separate IBKR module
 from ib_insync import IB, Future, Stock, Contract
 import pandas as pd
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Constants ---
+ATR_HISTORY_FILE = 'atr_history.json'
 
 
 class ATRWindow(QMainWindow):
@@ -43,11 +49,17 @@ class ATRWindow(QMainWindow):
         self.previous_atr_values = []
         self.previous_atr_sources = []  # Track if value is "Calculated" or "User Inputted"
         
+        # Track last market data values for each symbol to detect market closures
+        self.last_market_data = {}  # {symbol: {'high': float, 'low': float, 'prev_close': float}}
+        
         # ATR history file path
         self.atr_history_file = os.path.join(os.path.dirname(__file__), 'atr_history.json')
         
         # Load ATR history
         self.atr_history = self.load_atr_history()
+        
+        # Track user-submitted ATR values (symbol -> timestamp when user submitted)
+        self.user_submitted_atr = {}  # {symbol: timestamp_key}
         
         # Adaptive Stop Loss toggle state
         self.send_adaptive_stops = False
@@ -147,9 +159,7 @@ class ATRWindow(QMainWindow):
         ])
         self.atr_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.atr_table.verticalHeader().setDefaultSectionSize(60)  # Increase row height for multi-line text
-        self.atr_table.cellChanged.connect(self.on_previous_atr_changed)
         self.atr_calc_layout.addWidget(self.atr_table)
-
         # Setup auto-refresh timer (60 seconds = 60000 ms)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.fetch_ibkr_data)
@@ -157,6 +167,79 @@ class ATRWindow(QMainWindow):
         
         # Fetch data immediately on startup
         self.fetch_ibkr_data()
+    
+    def calculate_tr_and_atr(self, df, prior_atr, symbol=None):
+        """
+        Calculate True Range (TR) and Average True Range (ATR) for a given dataframe.
+        
+        Uses 15-minute candle data:
+        - Current high/low are from the current 15-minute candle
+        - Previous close is from the previous 15-minute candle
+        
+        TR is the maximum of:
+        - Current High - Current Low
+        - |Current High - Previous Close|
+        - |Current Low - Previous Close|
+        
+        ATR is calculated using exponential smoothing:
+        ATR = (Prior ATR × 13 + Current TR) / 14
+        
+        If the market data values (high, low, prev_close) are the same as the previous
+        calculation, this indicates a market closure and the previous ATR is reused.
+        
+        Args:
+            df: DataFrame with columns 'high', 'low', 'close' (15-minute candles)
+            prior_atr: The previous ATR value (from previous 15-minute interval)
+            symbol: Optional symbol name for tracking market data changes
+        
+        Returns:
+            tuple: (current_tr, current_atr) or (None, None) if insufficient data
+        """
+        if len(df) < 2:
+            return None, None
+
+        # Calculate current TR
+        prev_close = df['close'].iloc[-2]
+        current_high = df['high'].iloc[-1]
+        current_low = df['low'].iloc[-1]
+
+        # Check if market data is the same as previous calculation (market closure)
+        if symbol and symbol in self.last_market_data:
+            last_data = self.last_market_data[symbol]
+            if (last_data['high'] == current_high and 
+                last_data['low'] == current_low and 
+                last_data['prev_close'] == prev_close):
+                # Market data unchanged - reuse previous ATR (market likely closed)
+                print(f"Market data unchanged for {symbol} - reusing previous ATR: {prior_atr:.2f}")
+                current_tr = max(current_high - current_low, 
+                               abs(current_high - prev_close), 
+                               abs(current_low - prev_close))
+                return current_tr, prior_atr
+
+        # Store current market data for next comparison
+        if symbol:
+            self.last_market_data[symbol] = {
+                'high': current_high,
+                'low': current_low,
+                'prev_close': prev_close
+            }
+
+        # True Range (current)
+        tr1 = current_high - current_low
+        tr2 = abs(current_high - prev_close)
+        tr3 = abs(current_low - prev_close)
+        current_tr = max(tr1, tr2, tr3)
+
+        # If TR is 0, keep ATR unchanged
+        if current_tr == 0:
+            print(f"TR is 0 for {symbol if symbol else 'symbol'} - keeping ATR unchanged at {prior_atr:.2f}")
+            return current_tr, prior_atr
+
+        # ATR using the calculated prior ATR from previous 15-minute interval
+        # Formula: ATR = (Prior ATR × 13 + Current TR) / 14
+        current_atr = (prior_atr * 13 + current_tr) / 14
+
+        return current_tr, current_atr
 
     def populate_positions_table(self):
         self.table.setRowCount(len(self.positions))
@@ -224,45 +307,30 @@ class ATRWindow(QMainWindow):
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
-        # Temporarily disconnect the cellChanged signal to avoid triggering during population
-        self.atr_table.cellChanged.disconnect(self.on_previous_atr_changed)
-        
         self.atr_table.setRowCount(len(self.atr_symbols))
         for i in range(len(self.atr_symbols)):
             # Symbol (read-only)
             symbol_item = QTableWidgetItem(self.atr_symbols[i])
             symbol_item.setFlags(symbol_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.atr_table.setItem(i, 0, symbol_item)
-            
-            # Previous ATR with source indicator
+
+            # Previous ATR (read-only)
             prev_atr = self.previous_atr_values[i]
-            source = self.previous_atr_sources[i] if i < len(self.previous_atr_sources) else None
-            
             if prev_atr is None:
-                prev_atr_item = QTableWidgetItem("Enter value")
-                prev_atr_item.setBackground(QtGui.QColor(255, 200, 200))  # Light red
+                prev_atr_item = QTableWidgetItem("N/A")
             else:
-                # Create cell with value and source on separate lines
-                text = f"{prev_atr:.2f}\n({source})" if source else f"{prev_atr:.2f}"
-                prev_atr_item = QTableWidgetItem(text)
-                # Make the second line gray using font
-                font = prev_atr_item.font()
-                font.setPointSize(8)  # Smaller font for the whole cell
-            
+                prev_atr_item = QTableWidgetItem(f"{prev_atr:.2f}")
+            prev_atr_item.setFlags(prev_atr_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.atr_table.setItem(i, 1, prev_atr_item)
-            
+
             # TR (read-only)
             tr_item = QTableWidgetItem(f"{self.tr_values[i]:.2f}")
             tr_item.setFlags(tr_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.atr_table.setItem(i, 2, tr_item)
-            
-            # ATR (read-only)
+
+            # ATR (editable)
             atr_item = QTableWidgetItem(f"{self.atr_calculated[i]:.2f}" if self.atr_calculated[i] is not None else "N/A")
-            atr_item.setFlags(atr_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.atr_table.setItem(i, 3, atr_item)
-        
-        # Reconnect the signal
-        self.atr_table.cellChanged.connect(self.on_previous_atr_changed)
 
     def load_atr_history(self):
         """Load ATR history from JSON file"""
@@ -270,7 +338,7 @@ class ATRWindow(QMainWindow):
             try:
                 with open(self.atr_history_file, 'r') as f:
                     return json.load(f)
-            except Exception as e:
+            except (json.JSONDecodeError, IOError) as e:
                 print(f"Error loading ATR history: {e}")
                 return {}
         return {}
@@ -280,73 +348,114 @@ class ATRWindow(QMainWindow):
         try:
             with open(self.atr_history_file, 'w') as f:
                 json.dump(self.atr_history, f, indent=2)
-            print("ATR history saved successfully")
+            logging.info("ATR history saved successfully")
         except Exception as e:
             print(f"Error saving ATR history: {e}")
     
     def get_previous_atr(self, symbol):
-        """Get yesterday's ATR for a symbol, or None if not available"""
-        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        if symbol in self.atr_history:
-            if yesterday in self.atr_history[symbol]:
-                return self.atr_history[symbol][yesterday]
-        return None
+        """Get the most recent ATR for a symbol from the last 15-minute interval, or None if not available
+        
+        If no ATR is found from exactly 15 minutes ago (e.g., during market closures),
+        this will return the last available ATR value to account for nights and weekends.
+        """
+        if symbol not in self.atr_history:
+            return None
+        
+        # Get current time rounded down to nearest 15-minute interval
+        now = datetime.now()
+        current_interval = self.get_15min_interval_key(now)
+        
+        # Get all timestamps for this symbol and sort them (most recent first)
+        timestamps = sorted(self.atr_history[symbol].keys(), reverse=True)
+        
+        if not timestamps:
+            return None
+        
+        # Find the most recent ATR value that's not from the current interval
+        for timestamp in timestamps:
+            if timestamp != current_interval:
+                return self.atr_history[symbol][timestamp]
+        
+        # If all timestamps are from current interval (unlikely), return the most recent one
+        # This handles edge cases where we only have current interval data
+        return self.atr_history[symbol][timestamps[0]]
+    
+    def get_15min_interval_key(self, dt=None):
+        """Get the 15-minute interval key for a given datetime (or current time)"""
+        if dt is None:
+            dt = datetime.now()
+        
+        # Round down to nearest 15-minute interval
+        minute = (dt.minute // 15) * 15
+        interval_time = dt.replace(minute=minute, second=0, microsecond=0)
+        
+        # Format: YYYY-MM-DD HH:MM
+        return interval_time.strftime('%Y-%m-%d %H:%M')
+    
+    def cleanup_old_atr_data(self):
+        """Remove ATR data older than 7 days (1 week)"""
+        cutoff_time = datetime.now() - timedelta(days=7)
+        
+        symbols_to_remove = []
+        for symbol in self.atr_history:
+            timestamps_to_remove = []
+            for timestamp in self.atr_history[symbol]:
+                try:
+                    # Parse the timestamp
+                    timestamp_dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M')
+                    # If older than 24 hours, mark for removal
+                    if timestamp_dt < cutoff_time:
+                        timestamps_to_remove.append(timestamp)
+                except ValueError:
+                    # Handle old format (date only) - remove it
+                    try:
+                        timestamp_dt = datetime.strptime(timestamp, '%Y-%m-%d')
+                        if timestamp_dt < cutoff_time:
+                            timestamps_to_remove.append(timestamp)
+                    except ValueError:
+                        print(f"Invalid timestamp format: {timestamp}")
+                        timestamps_to_remove.append(timestamp)
+            
+            # Remove old timestamps
+            for timestamp in timestamps_to_remove:
+                del self.atr_history[symbol][timestamp]
+                logging.info(f"Removed old ATR data for {symbol} at {timestamp}")
+            
+            # If symbol has no more data, mark for removal
+            if not self.atr_history[symbol]:
+                symbols_to_remove.append(symbol)
+        
+        # Remove symbols with no data
+        for symbol in symbols_to_remove:
+            del self.atr_history[symbol]
+            logging.info(f"Removed symbol {symbol} (no data remaining)")
+        
+        # Save the cleaned history
+        if timestamps_to_remove or symbols_to_remove:
+            self.save_atr_history()
     
     def save_today_atr(self, symbol, atr_value):
-        """Save today's ATR for a symbol (overwrites any existing value for today)"""
-        today = datetime.now().strftime('%Y-%m-%d')
+        """Save ATR for a symbol at the current 15-minute interval"""
+        interval_key = self.get_15min_interval_key()
+        
         if symbol not in self.atr_history:
             self.atr_history[symbol] = {}
         
-        # Check if we're overwriting an existing value
-        if today in self.atr_history[symbol]:
-            old_value = self.atr_history[symbol][today]
-            print(f"Overwriting existing ATR for {symbol} on {today}: {old_value:.2f} -> {atr_value:.2f}")
+        # Check if we're overwriting an existing value for this interval
+        if interval_key in self.atr_history[symbol]:
+            old_value = self.atr_history[symbol][interval_key]
+            logging.info(f"Overwriting existing ATR for {symbol} at {interval_key}: {old_value:.2f} -> {atr_value:.2f}")
         else:
-            print(f"Saving new ATR for {symbol} on {today}: {atr_value:.2f}")
+            logging.info(f"Saving new ATR for {symbol} at {interval_key}: {atr_value:.2f}")
         
-        # Save/overwrite today's value
-        self.atr_history[symbol][today] = atr_value
+        # Save/overwrite this interval's value
+        self.atr_history[symbol][interval_key] = atr_value
+        
+        # Clean up old data before saving
+        self.cleanup_old_atr_data()
+        
         self.save_atr_history()
 
-    def on_previous_atr_changed(self, row, column):
-        """Handle when user edits the Previous ATR column"""
-        if column == 1:  # Previous ATR column
-            try:
-                # Extract just the numeric value (ignore the source text if present)
-                cell_text = self.atr_table.item(row, column).text()
-                # Get first line only (the numeric value)
-                numeric_value = cell_text.split('\n')[0].strip()
-                new_value = float(numeric_value)
-                symbol = self.atr_table.item(row, 0).text()
-                
-                # Update the previous_atr_values list and mark as user inputted
-                self.previous_atr_values[row] = new_value
-                self.previous_atr_sources[row] = "User Inputted"
-                
-                # Remove red background and update cell with source
-                self.atr_table.cellChanged.disconnect(self.on_previous_atr_changed)
-                new_text = f"{new_value:.2f}\n(User Inputted)"
-                self.atr_table.item(row, column).setText(new_text)
-                # Clear background color to use default (transparent)
-                self.atr_table.item(row, column).setBackground(QtGui.QBrush())
-                self.atr_table.cellChanged.connect(self.on_previous_atr_changed)
-                
-                # Save to history as yesterday's value so it can be used
-                yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-                if symbol not in self.atr_history:
-                    self.atr_history[symbol] = {}
-                self.atr_history[symbol][yesterday] = new_value
-                self.save_atr_history()
-                
-                # Recalculate ATR for this symbol
-                print(f"Recalculating ATR for {symbol} with user-inputted previous ATR: {new_value}")
-                self.recalculate_single_symbol_atr(row, symbol, new_value)
-                
-            except ValueError:
-                print("Invalid value for Previous ATR. Please enter a number.")
-                self.atr_table.item(row, column).setBackground(QtGui.QColor(255, 200, 200))
-    
     def recalculate_single_symbol_atr(self, row, symbol, prior_atr):
         """Recalculate ATR for a single symbol with the given prior ATR"""
         ib = IB()
@@ -377,8 +486,8 @@ class ATRWindow(QMainWindow):
             bars = ib.reqHistoricalData(
                 contract,
                 endDateTime='',
-                durationStr='14 D',
-                barSizeSetting='1 day',
+                durationStr='1 D',
+                barSizeSetting='15 mins',
                 whatToShow='TRADES',
                 useRTH=True,
                 formatDate=1
@@ -393,22 +502,18 @@ class ATRWindow(QMainWindow):
                     'volume': b.volume
                 } for b in bars])
                 
-                tr, atr = calculate_tr_and_atr(df, prior_atr=prior_atr)
+                tr, atr = self.calculate_tr_and_atr(df, prior_atr=prior_atr, symbol=symbol)
                 
                 if tr is not None and atr is not None:
                     # Update the values
                     self.tr_values[row] = tr
                     self.atr_calculated[row] = atr
                     
-                    # Update table cells (disconnect signal first)
-                    self.atr_table.cellChanged.disconnect(self.on_previous_atr_changed)
                     self.atr_table.item(row, 2).setText(f"{tr:.2f}")
                     self.atr_table.item(row, 3).setText(f"{atr:.2f}")
-                    self.atr_table.cellChanged.connect(self.on_previous_atr_changed)
-                    
                     # Save today's ATR
                     self.save_today_atr(symbol, atr)
-                    print(f"Updated: Symbol: {symbol}, TR: {tr:.2f}, ATR: {atr:.2f}")
+                    logging.info(f"Updated: Symbol: {symbol}, TR: {tr:.2f}, ATR: {atr:.2f}")
                     
                     # Update the Positions table to show the new ATR value
                     self.populate_positions_table()
@@ -425,10 +530,89 @@ class ATRWindow(QMainWindow):
         # Update checkbox text
         if self.send_adaptive_stops:
             self.adaptive_stop_toggle.setText("ON")
+            # Submit stop loss orders immediately when enabled
+            self.submit_adaptive_stop_losses()
         else:
             self.adaptive_stop_toggle.setText("OFF")
         status_text = "ENABLED" if self.send_adaptive_stops else "DISABLED"
-        print(f"Adaptive Stop Losses: {status_text}")
+        logging.info(f"Adaptive Stop Losses: {status_text}")
+    
+    def submit_adaptive_stop_losses(self):
+        """Submit stop loss orders for all positions based on computed stop losses"""
+        if not self.send_adaptive_stops:
+            print("Adaptive stop losses are disabled, skipping order submission")
+            return
+        
+        # Build stop loss data for each symbol
+        stop_loss_data = {}
+        
+        for i, symbol in enumerate(self.symbols):
+            # Get ATR value
+            atr_value = None
+            if symbol in self.atr_symbols:
+                atr_index = self.atr_symbols.index(symbol)
+                if self.atr_calculated[atr_index] is not None:
+                    atr_value = self.atr_calculated[atr_index]
+            
+            # Get computed stop loss (using the same logic as the table)
+            stop_price = self.compute_stop_loss(
+                symbol,
+                self.current_prices[i],
+                atr_value,
+                self.atr_ratios[i]
+            )
+            
+            # Get contract details
+            contract_details = self.contract_details_map.get(symbol, {})
+            
+            # Skip if no valid stop price
+            if stop_price <= 0:
+                print(f"Skipping {symbol}: No valid stop price computed")
+                continue
+            
+            # Skip stocks/ETFs if desired (uncomment to enable)
+            # if contract_details.get('secType') == 'STK':
+            #     print(f"Skipping {symbol}: Stock/ETF")
+            #     continue
+            
+            stop_loss_data[symbol] = {
+                'stop_price': stop_price,
+                'quantity': self.positions_held[i],
+                'contract_details': contract_details
+            }
+            
+            logging.info(f"Preparing stop loss for {symbol}: {self.positions_held[i]} @ {stop_price:.2f}")
+        
+        if not stop_loss_data:
+            print("No valid stop loss orders to submit")
+            return
+        
+        # Submit the stop loss orders
+        print(f"\nSubmitting {len(stop_loss_data)} stop loss order(s)...")
+        results, success = submit_stop_loss_orders(stop_loss_data)
+        
+        # Update status based on results
+        for result in results:
+            symbol = result.get('symbol', 'Unknown')
+            status = result.get('status', 'unknown')
+            
+            # Find the row for this symbol and update status
+            if symbol in self.symbols:
+                idx = self.symbols.index(symbol)
+                if status == 'submitted':
+                    self.statuses[idx] = f"Stop @ {result.get('stop_price', 0):.2f}"
+                elif status == 'error':
+                    self.statuses[idx] = f"Error: {result.get('message', 'Unknown')}"
+                elif status == 'skipped':
+                    self.statuses[idx] = f"Skipped: {result.get('message', '')}"
+        
+        # Refresh the table to show updated statuses
+        self.populate_positions_table()
+        
+        if success:
+            logging.info("Stop loss orders submitted successfully")
+        else:
+            logging.warning("Some stop loss orders may have failed")
 
     def update_atr_ratio(self, row, value):
         self.atr_ratios[row] = value
@@ -455,7 +639,6 @@ class ATRWindow(QMainWindow):
         self.tr_values.clear()
         self.atr_calculated.clear()
         self.previous_atr_values.clear()
-        self.previous_atr_sources.clear()
         
         ib = IB()
         try:
@@ -480,13 +663,13 @@ class ATRWindow(QMainWindow):
                         # Use conId for most accurate contract identification
                         contract = Contract(conId=contract_info['conId'])
                         ib.qualifyContracts(contract)
-                        print(f"Using conId {contract_info['conId']} for {symbol}")
+                        logging.info(f"Using conId {contract_info['conId']} for {symbol}")
                     elif contract_info.get('lastTradeDateOrContractMonth'):
                         # Use actual expiration date from position
                         contract = Future(
                             symbol=symbol,
                             lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
-                            exchange=contract_info.get('exchange', 'CME'),
+                            exchange=contract_info.get('exchange', 'CME'), # Default to CME if not specified
                             currency=contract_info.get('currency', 'USD')
                         )
                         ib.qualifyContracts(contract)
@@ -496,12 +679,12 @@ class ATRWindow(QMainWindow):
                         print(f"No contract details available for {symbol}, skipping ATR calculation")
                         continue
                     
-                    # Get historical bars (14 days for ATR calculation)
+                    # Get historical bars (1 day of 15-minute candles for ATR calculation)
                     bars = ib.reqHistoricalData(
                         contract,
                         endDateTime='',
-                        durationStr='14 D',
-                        barSizeSetting='1 day',
+                        durationStr='1 D',
+                        barSizeSetting='15 mins',
                         whatToShow='TRADES',
                         useRTH=True,
                         formatDate=1
@@ -528,25 +711,37 @@ class ATRWindow(QMainWindow):
                     tr3 = abs(current_low - prev_close)
                     current_tr = max(tr1, tr2, tr3)
                     
-                    # Determine source and calculate ATR
-                    if previous_atr is not None:
-                        current_atr = (previous_atr * 13 + current_tr) / 14
-                        source = "Calculated"  # From history, previously calculated
-                        print(f"Symbol: {symbol}, Previous ATR: {previous_atr:.2f}, TR: {current_tr:.2f}, ATR: {current_atr:.2f}")
+                    # Calculate ATR at the END of the interval (when candle closes)
+                    # The last closed candle represents the most recently COMPLETED interval
+                    # We calculate ATR for that completed interval, not the current one
+                    
+                    # Get the interval key for the last CLOSED candle (most recent completed interval)
+                    # The last bar in the data is the most recently closed 15-min candle
+                    last_bar_time = bars[-1].date
+                    completed_interval_key = self.get_15min_interval_key(last_bar_time)
+                    
+                    # Check if ATR already exists for this completed interval
+                    if symbol in self.atr_history and completed_interval_key in self.atr_history[symbol]:
+                        # ATR already calculated for this completed interval - use existing value
+                        current_atr = self.atr_history[symbol][completed_interval_key]
+                        logging.info(f"Symbol: {symbol}, ATR already calculated for completed interval {completed_interval_key}: {current_atr:.2f} (skipping calculation)")
+                    elif previous_atr is not None:
+                        # Calculate new ATR for the completed interval
+                        tr, current_atr = self.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
+                        logging.info(f"Symbol: {symbol}, Calculating ATR for completed interval {completed_interval_key}")
+                        logging.info(f"  Previous ATR: {previous_atr:.2f}, TR: {tr:.2f}, New ATR: {current_atr:.2f}")
                         
-                        # Save today's ATR
-                        self.save_today_atr(symbol, current_atr)
-                    else:
-                        current_atr = None
-                        source = None  # No previous value
-                        print(f"Symbol: {symbol}, TR: {current_tr:.2f}, ATR: N/A (No previous ATR - please enter value)")
+                        # Save ATR for the completed interval
+                        if symbol not in self.atr_history:
+                            self.atr_history[symbol] = {}
+                        self.atr_history[symbol][completed_interval_key] = current_atr
+                        self.save_atr_history()
                     
                     # Store the values
                     self.atr_symbols.append(symbol)
                     self.tr_values.append(current_tr)
                     self.atr_calculated.append(current_atr)
                     self.previous_atr_values.append(previous_atr)
-                    self.previous_atr_sources.append(source)
                 
                 except Exception as e:
                     print(f"Error calculating ATR for {symbol}: {e}")
@@ -613,6 +808,10 @@ class ATRWindow(QMainWindow):
             # Calculate ATR for all symbols if we have positions
             if self.symbols:
                 self.calculate_atr_for_symbols(self.symbols)
+            
+            # Submit stop loss orders if adaptive stops are enabled
+            if self.send_adaptive_stops:
+                self.submit_adaptive_stop_losses()
 
         except Exception as e:
             self.raw_data_view.setPlainText(f"Error fetching data: {e}")
