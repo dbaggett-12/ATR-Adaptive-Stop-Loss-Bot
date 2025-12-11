@@ -46,8 +46,12 @@ def fetch_positions():
                     print(f"Warning: Could not request market data for {pos.contract.symbol}: {e}")
                     tickers[pos.contract.symbol] = (pos, None)
             
-            # Wait for market data to populate (up to 2 seconds)
-            ib.sleep(2)
+            # Wait for market data to populate. A simple, longer sleep is more reliable
+            # than a complex loop, as it gives all tickers a chance to update without
+            # exiting prematurely.
+            print("Waiting for market data to populate...")
+            ib.sleep(5) # Process events for 5 seconds to allow all data to arrive.
+            print("Finished waiting for market data.")
             
             for symbol, (pos, ticker) in tickers.items():
                 # Get values directly from IBKR position object
