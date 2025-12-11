@@ -1,7 +1,6 @@
 from ib_insync import IB, util, Contract, StopOrder
 from time import sleep
 import random
-import math
 from datetime import datetime
 import logging
 import pytz
@@ -12,15 +11,15 @@ def fetch_positions():
     results_list: list of dicts with position data
     connection_success: True if successfully connected and retrieved data, False otherwise
     """
+    # This function is now a wrapper for staged fetching.
     ib = IB()
-    results = []
     connection_success = False
-    
+    positions_data = []
+
     # Try multiple clientIds in case one is still in use
     max_retries = 5
     for attempt in range(max_retries):
         client_id = random.randint(100, 999)
-        
         try:
             print(f"Attempting to connect with clientId {client_id}...")
             ib.connect('127.0.0.1', 7497, clientId=client_id)
@@ -28,118 +27,11 @@ def fetch_positions():
             
             positions = ib.positions()
             
-            # Qualify contracts first to fill in missing details like exchange
-            contracts = [pos.contract for pos in positions]
-            ib.qualifyContracts(*contracts)
-            
-            # Request delayed market data (type 3) if live data is not available
-            # Type 1 = Live, Type 2 = Frozen, Type 3 = Delayed, Type 4 = Delayed-Frozen
-            ib.reqMarketDataType(3)
-            
-            # Request market data for all positions
-            tickers = {}
-            for pos in positions:
-                try:
-                    ticker = ib.reqMktData(pos.contract, "", False, False)
-                    tickers[pos.contract.symbol] = (pos, ticker)
-                except Exception as e:
-                    print(f"Warning: Could not request market data for {pos.contract.symbol}: {e}")
-                    tickers[pos.contract.symbol] = (pos, None)
-            
-            # Wait for market data to populate. A simple, longer sleep is more reliable
-            # than a complex loop, as it gives all tickers a chance to update without
-            # exiting prematurely.
-            print("Waiting for market data to populate...")
-            ib.sleep(5) # Process events for 5 seconds to allow all data to arrive.
-            print("Finished waiting for market data.")
-            
-            for symbol, (pos, ticker) in tickers.items():
-                # Get values directly from IBKR position object
-                positions_held = float(pos.position)
-                raw_avg_cost = float(pos.avgCost)
-                
-                # Get security type and multiplier
-                sec_type = pos.contract.secType if hasattr(pos.contract, 'secType') else 'STK'
-                
-                # Get contract multiplier (for futures, this is the contract size)
-                multiplier = 1.0
-                if hasattr(pos.contract, 'multiplier') and pos.contract.multiplier:
-                    try:
-                        multiplier = float(pos.contract.multiplier)
-                    except (ValueError, TypeError):
-                        multiplier = 1.0
-                
-                # Handle avgCost based on security type
-                # For FUTURES (FUT): IBKR's avgCost includes the multiplier, so divide to get entry price
-                # For STOCKS (STK) and ETFs: avgCost IS the actual entry price, don't divide
-                if sec_type == 'FUT' and multiplier > 1:
-                    avg_cost = raw_avg_cost / multiplier
-                else:
-                    avg_cost = raw_avg_cost
-                
-                print(f"DEBUG {symbol}: secType={sec_type}, raw_avgCost={raw_avg_cost}, multiplier={multiplier}, avg_cost={avg_cost}")
+            # Stage 1: Get basic position data
+            positions_data = fetch_basic_positions(ib, positions)
+            # Stage 2: Enrich with market data
+            positions_data = fetch_market_data_for_positions(ib, positions_data)
 
-                # Try to get the best available price
-                current_price = 0.0
-                
-                if ticker is not None:
-                    # Check last price first
-                    if ticker.last and not math.isnan(ticker.last) and ticker.last > 0:
-                        current_price = ticker.last
-                    # Fall back to close price
-                    elif ticker.close and not math.isnan(ticker.close) and ticker.close > 0:
-                        current_price = ticker.close
-                    # Fall back to bid/ask midpoint
-                    elif ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
-                        current_price = (ticker.bid + ticker.ask) / 2
-                    # Last resort: use market price from ticker
-                    elif ticker.marketPrice() and not math.isnan(ticker.marketPrice()):
-                        current_price = ticker.marketPrice()
-
-                # Calculate market values and P/L
-                # For futures: cost_basis and market_value should include multiplier
-                cost_basis = avg_cost * multiplier * abs(positions_held)
-                market_value = current_price * multiplier * abs(positions_held)
-                
-                # P/L calculation (handles both long and short positions)
-                if positions_held > 0:  # Long position
-                    unrealized_pl = market_value - cost_basis
-                else:  # Short position
-                    unrealized_pl = cost_basis - market_value
-                
-                # P/L percentage based on cost basis
-                pl_percent = (unrealized_pl / cost_basis) * 100 if cost_basis != 0 else 0.0
-
-                # Store contract details for ATR calculations
-                contract_details = {
-                    'secType': sec_type,
-                    'exchange': pos.contract.exchange if hasattr(pos.contract, 'exchange') else '',
-                    'currency': pos.contract.currency if hasattr(pos.contract, 'currency') else 'USD',
-                    'lastTradeDateOrContractMonth': pos.contract.lastTradeDateOrContractMonth if hasattr(pos.contract, 'lastTradeDateOrContractMonth') else '',
-                    'conId': pos.contract.conId if hasattr(pos.contract, 'conId') else 0,
-                }
-                
-                results.append({
-                    'position': pos.contract.symbol,
-                    'symbol': symbol,
-                    'positions_held': positions_held,
-                    'avg_cost': avg_cost,  # This is now the actual entry price
-                    'current_price': current_price,
-                    'multiplier': multiplier,
-                    'cost_basis': cost_basis,
-                    'market_value': market_value,
-                    'unrealized_pl': unrealized_pl,
-                    'pl_percent': pl_percent,
-                    'contract_details': contract_details
-                })
-            
-            # Cancel market data subscriptions
-            for symbol, (pos, ticker) in tickers.items():
-                if ticker is not None:
-                    try:
-                        ib.cancelMktData(pos.contract)
-                    except Exception:
-                        pass
             connection_success = True
             break  # Success, exit the retry loop
             
@@ -165,10 +57,15 @@ def fetch_positions():
             if ib.isConnected():
                 ib.disconnect()
 
-    return results, connection_success
+    return positions_data, connection_success
 
 
-def submit_stop_loss_orders(stop_loss_data):
+from ib_insync.objects import Position
+from typing import List, Dict
+import math
+
+
+def _submit_stop_loss_orders_internal(ib, stop_loss_data):
     """
     Submit stop loss orders for each symbol in stop_loss_data.
     Cancels any existing orders for each symbol before submitting new stop loss.
@@ -184,31 +81,26 @@ def submit_stop_loss_orders(stop_loss_data):
         results_list: list of dicts with order submission results
         success: True if all orders submitted successfully
     """
-    ib = IB()
     results = []
-    success = False
     
-    if not stop_loss_data:
+    if not stop_loss_data: # stop_loss_data is now just the orders_to_submit dict
         print("No stop loss data provided")
-        return results, False
+        return results
     
-    max_retries = 5
-    for attempt in range(max_retries):
-        client_id = random.randint(100, 999)
-        
-        try:
-            print(f"Attempting to connect with clientId {client_id} for stop loss orders...")
-            ib.connect('127.0.0.1', 7497, clientId=client_id)
-            print(f"Successfully connected with clientId {client_id}")
-            
+    try:
+            print(f"\nSubmitting {len(stop_loss_data)} stop loss order(s)...")
             # Get all open trades and create a map of symbol to existing stop order
             open_trades = ib.openTrades()
             existing_stop_orders = {}
             for trade in open_trades:
                 # Ensure it's a Stop order
                 if trade.order.orderType == 'STP':
+                    # Use conId for a more reliable key than symbol
+                    conId = trade.contract.conId
+                    existing_stop_orders[conId] = trade
                     existing_stop_orders[trade.contract.symbol] = trade
             print(f"Found {len(existing_stop_orders)} existing stop orders.")
+            trades_to_monitor = []
 
             for symbol, data in stop_loss_data.items():
                 try:
@@ -259,86 +151,69 @@ def submit_stop_loss_orders(stop_loss_data):
                         action = 'BUY'
                         order_quantity = abs(quantity)
 
-                    # Check if an order already exists for this symbol
-                    existing_trade = existing_stop_orders.get(symbol)
+                    # Check if an order already exists for this contract's conId
+                    existing_trade = existing_stop_orders.get(con_id)
 
-                    if existing_trade:
-                        # An order exists, check if modification is needed
-                        existing_order = existing_trade.order
-                        if existing_order.stopPrice == round(stop_price, 2):
-                            print(f"No change needed for {symbol}: Stop price is already {stop_price:.2f}")
-                            results.append({'symbol': symbol, 'status': 'unchanged', 'message': 'Stop price is already correct.'})
-                            continue
-                        else:
-                            # Modify the existing order
-                            print(f"Modifying {symbol} stop order from {existing_order.stopPrice} to {stop_price:.2f}")
-                            stop_order = existing_order
-                            stop_order.stopPrice = round(stop_price, 2)
+                    if not existing_trade:
+                        # This is a new order, handle it in a separate pass
+                        continue
+
+                    # --- This is an existing order, handle modification ---
+                    existing_order = existing_trade.order
+                    if existing_order.stopPrice == round(stop_price, 2):
+                        print(f"No change needed for {symbol}: Stop price is already {stop_price:.2f}")
+                        results.append({'symbol': symbol, 'status': 'unchanged', 'message': 'Stop price is already correct.'})
+                        continue
                     else:
-                        # No order exists, create a new one
-                        print(f"Creating new {action} STOP order for {symbol}: {order_quantity} @ {stop_price:.2f}")
+                        # To safely modify, create a new order object with the existing order's ID
+                        print(f"Modifying {symbol} stop order from {existing_order.stopPrice} to {stop_price:.2f}")
                         stop_order = StopOrder(
                             action=action,
                             totalQuantity=order_quantity,
                             stopPrice=round(stop_price, 2),
-                            tif='GTC'  # Good Till Cancelled
+                            orderId=existing_order.orderId, # IMPORTANT: Use existing orderId
+                            tif='GTC'
                         )
+                        trade = ib.placeOrder(contract, stop_order)
+                        trades_to_monitor.append(trade)
+
+                except Exception as e:
+                    print(f"Error processing modification for {symbol}: {e}")
+                    results.append({'symbol': symbol, 'status': 'error', 'message': str(e)})
+            
+            # Give modifications a moment to process
+            if any(t for t in trades_to_monitor if t.order.orderId != 0):
+                print("Pausing for 1 second after modifications...")
+                ib.sleep(1)
+
+            # --- Second Pass: Create NEW orders ---
+            for symbol, data in stop_loss_data.items():
+                try:
+                    con_id = data.get('contract_details', {}).get('conId', 0)
+                    if con_id in existing_stop_orders:
+                        # Already handled in the modification pass
+                        continue
+
+                    # This is a new order
+                    stop_price = data.get('stop_price', 0)
+                    quantity = data.get('quantity', 0)
+                    contract = Contract(conId=con_id)
+                    ib.qualifyContracts(contract)
+                    
+                    action = 'SELL' if quantity > 0 else 'BUY'
+                    order_quantity = abs(quantity)
+
+                    print(f"Creating new {action} STOP order for {symbol}: {order_quantity} @ {stop_price:.2f}")
+                    stop_order = StopOrder(
+                        action=action,
+                        totalQuantity=order_quantity,
+                        stopPrice=round(stop_price, 2),
+                        tif='GTC'
+                    )
 
                     # Place the new or modified order
                     trade = ib.placeOrder(contract, stop_order)
-                    
-                    # --- Wait for order status to confirm submission ---
-                    # This logic remains the same for both new and modified orders.
-                    # It ensures we wait for IBKR to acknowledge the request.
-                    
-                    # Wait for order to reach a stable state (submitted or rejected)
-                    # Valid statuses: PendingSubmit, PreSubmitted, Submitted, Filled
-                    valid_statuses = ['PendingSubmit', 'PreSubmitted', 'Submitted', 'Filled', 'ApiPending']
-                    max_wait = 10  # Maximum wait time in seconds
-                    wait_interval = 0.5
-                    waited = 0
-                    
-                    while waited < max_wait:
-                        ib.sleep(wait_interval)
-                        waited += wait_interval
-                        order_status = trade.orderStatus.status if trade.orderStatus else ''
-                        print(f"  {symbol} order status: {order_status} (waited {waited:.1f}s)")
-                        
-                        if order_status in valid_statuses:
-                            print(f"  Order for {symbol} reached {order_status} - pushing to IBKR")
-                            break
-                        elif order_status in ['Cancelled', 'ApiCancelled', 'Inactive']:
-                            print(f"  Order for {symbol} was rejected: {order_status}")
-                            break
-                    
-                    # Final status check
-                    final_status = trade.orderStatus.status if trade.orderStatus else 'Unknown'
-                    order_pushed = final_status in valid_statuses
-                    
-                    if order_pushed:
-                        print(f"SUCCESS: {symbol} STOP order pushed to IBKR - Status: {final_status}, OrderId: {trade.order.orderId}")
-                        results.append({
-                            'symbol': symbol,
-                            'status': 'submitted',
-                            'order_id': trade.order.orderId,
-                            'action': action,
-                            'quantity': order_quantity,
-                            'stop_price': stop_price,
-                            'order_status': final_status,
-                            'message': 'Order submitted successfully.'
-                        })
-                    else:
-                        print(f"WARNING: {symbol} order may not have been accepted - Status: {final_status}")
-                        results.append({
-                            'symbol': symbol,
-                            'status': 'pending',
-                            'order_id': trade.order.orderId if trade.order else 0,
-                            'action': action,
-                            'quantity': order_quantity,
-                            'stop_price': stop_price,
-                            'order_status': final_status,
-                            'message': f'Order status: {final_status}'
-                        })
+                    trades_to_monitor.append(trade)
                     
                 except Exception as e:
                     print(f"Error processing stop loss for {symbol}: {e}")
@@ -348,29 +223,63 @@ def submit_stop_loss_orders(stop_loss_data):
                         'message': str(e)
                     })
             
-            success = True
-            break  # Success, exit retry loop
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"Attempt {attempt + 1} failed with clientId {client_id}: {error_msg}")
-            
-            if "client id" in error_msg.lower() or "clientid" in error_msg.lower():
-                if attempt < max_retries - 1:
-                    print("ClientId conflict detected, retrying with a different clientId...")
-                    sleep(0.5)
-                    continue
+            # --- Wait for all submitted orders to be processed ---
+            if trades_to_monitor:
+                print(f"\nWaiting for {len(trades_to_monitor)} order(s) to be processed...")
+                max_wait = 15  # seconds
+                waited = 0
+                while waited < max_wait:
+                    ib.sleep(1) # Process events
+                    waited += 1
+                    if all(t.isDone() for t in trades_to_monitor):
+                        print("All orders have reached a final state.")
+                        break
+                    print(f"  ... still waiting for orders to complete ({waited}s)")
+
+            # --- Report final status for all monitored trades ---
+            valid_statuses = ['PendingSubmit', 'PreSubmitted', 'Submitted', 'Filled', 'ApiPending']
+            for trade in trades_to_monitor:
+                symbol = trade.contract.symbol
+                final_status = trade.orderStatus.status if trade.orderStatus else 'Unknown'
+                order_pushed = final_status in valid_statuses
+
+                # Safely get order details
+                action = getattr(trade.order, 'action', 'N/A')
+                quantity = getattr(trade.order, 'totalQuantity', 0)
+                stop_price = 0
+                if isinstance(trade.order, StopOrder):
+                    stop_price = getattr(trade.order, 'stopPrice', 0)
+
+                if order_pushed:
+                    print(f"SUCCESS: {symbol} STOP order pushed to IBKR - Status: {final_status}, OrderId: {trade.order.orderId}")
+                    results.append({
+                        'symbol': symbol,
+                        'status': 'submitted',
+                        'order_id': trade.order.orderId,
+                        'action': action,
+                        'quantity': quantity,
+                        'stop_price': stop_price,
+                        'order_status': final_status,
+                        'message': 'Order submitted successfully.'
+                    })
                 else:
-                    print("Max retries reached. Unable to connect.")
-            else:
-                print(f"Error connecting to IBKR: {e}")
-                break
-                
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
-    
-    return results, success
+                    print(f"WARNING: {symbol} order may not have been accepted - Status: {final_status}")
+                    # Even on failure, try to get the orderId if it exists
+                    order_id = getattr(trade.order, 'orderId', 0)
+                    results.append({
+                        'symbol': symbol,
+                        'status': 'pending',
+                        'order_id': order_id,
+                        'action': action,
+                        'quantity': quantity,
+                        'stop_price': stop_price,
+                        'order_status': final_status,
+                        'message': f'Order status: {final_status}'
+                    })
+
+    except Exception as e:
+        logging.error(f"An error occurred during stop loss submission: {e}")
+    return results
 
 def get_market_statuses_for_all(contracts_info):
     """
@@ -440,3 +349,137 @@ def get_market_statuses_for_all(contracts_info):
             ib.disconnect()
             
     return statuses
+
+def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]:
+    """
+    Stage 1: Fetches basic position data without market data.
+    Qualifies contracts and calculates entry price.
+    """
+    results = []
+    if not positions:
+        return results
+
+    # Qualify contracts first to fill in missing details like exchange
+    contracts = [pos.contract for pos in positions]
+    ib.qualifyContracts(*contracts)
+
+    for pos in positions:
+        positions_held = float(pos.position)
+        raw_avg_cost = float(pos.avgCost)
+        symbol = pos.contract.symbol
+
+        sec_type = pos.contract.secType if hasattr(pos.contract, 'secType') else 'STK'
+        
+        multiplier = 1.0
+        if hasattr(pos.contract, 'multiplier') and pos.contract.multiplier:
+            try:
+                multiplier = float(pos.contract.multiplier)
+            except (ValueError, TypeError):
+                multiplier = 1.0
+        
+        if sec_type == 'FUT' and multiplier > 1:
+            avg_cost = raw_avg_cost / multiplier
+        else:
+            avg_cost = raw_avg_cost
+
+        contract_details = {
+            'secType': sec_type,
+            'exchange': pos.contract.exchange or '',
+            'currency': pos.contract.currency or 'USD',
+            'lastTradeDateOrContractMonth': pos.contract.lastTradeDateOrContractMonth or '',
+            'conId': pos.contract.conId or 0,
+        }
+
+        results.append({
+            'position': pos.contract.symbol,
+            'symbol': symbol,
+            'positions_held': positions_held,
+            'avg_cost': avg_cost,
+            'multiplier': multiplier,
+            'contract_details': contract_details,
+            # Placeholders for data to be fetched later
+            'current_price': 0.0,
+            'cost_basis': 0.0,
+            'market_value': 0.0,
+            'unrealized_pl': 0.0,
+            'pl_percent': 0.0,
+        })
+    return results
+
+def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) -> List[Dict]:
+    """
+    Stage 2: Enriches position data with live market prices and contract details.
+    """
+    if not positions_data:
+        return []
+
+    # Create contracts from conIds for reliability
+    contracts = [Contract(conId=p['contract_details']['conId']) for p in positions_data]
+    ib.qualifyContracts(*contracts)
+
+    # Get full contract details to retrieve minTick
+    contract_details_objects = {}
+    for contract in contracts:
+        try:
+            cds = ib.reqContractDetails(contract)
+            if cds:
+                contract_details_objects[contract.symbol] = cds[0]
+        except Exception as e:
+            logging.error(f"Could not get contract details for {contract.symbol}: {e}")
+
+    # Request market data
+    ib.reqMarketDataType(3) # Delayed data
+    tickers = {}
+    for p in positions_data:
+        # Create contract with exchange to avoid validation errors
+        contract = Contract(conId=p['contract_details']['conId'], exchange=p['contract_details'].get('exchange', ''))
+        tickers[p['symbol']] = ib.reqMktData(contract, "", False, False)
+    
+    logging.info("Waiting for market data to populate...")
+    ib.sleep(5)
+    logging.info("Finished waiting for market data.")
+
+    for p_data in positions_data:
+        symbol = p_data['symbol']
+        ticker = tickers.get(symbol)
+        current_price = 0.0
+
+        if ticker:
+            if ticker.last and not math.isnan(ticker.last) and ticker.last > 0:
+                current_price = ticker.last
+            elif ticker.close and not math.isnan(ticker.close) and ticker.close > 0:
+                current_price = ticker.close
+            elif ticker.bid and ticker.ask and not math.isnan(ticker.bid) and not math.isnan(ticker.ask):
+                current_price = (ticker.bid + ticker.ask) / 2
+            elif ticker.marketPrice() and not math.isnan(ticker.marketPrice()):
+                current_price = ticker.marketPrice()
+        
+        p_data['current_price'] = current_price
+
+        # Update contract details with minTick
+        cd = contract_details_objects.get(symbol)
+        p_data['contract_details']['minTick'] = cd.minTick if cd else 0.01
+
+        # Recalculate market values and P/L
+        avg_cost = p_data['avg_cost']
+        multiplier = p_data['multiplier']
+        positions_held = p_data['positions_held']
+
+        cost_basis = avg_cost * multiplier * abs(positions_held)
+        market_value = current_price * multiplier * abs(positions_held)
+        
+        if positions_held > 0:
+            unrealized_pl = market_value - cost_basis
+        else:
+            unrealized_pl = cost_basis - market_value
+        
+        p_data['cost_basis'] = cost_basis
+        p_data['market_value'] = market_value
+        p_data['unrealized_pl'] = unrealized_pl
+        p_data['pl_percent'] = (unrealized_pl / cost_basis) * 100 if cost_basis != 0 else 0.0
+
+    # Cancel subscriptions
+    for ticker in tickers.values():
+        ib.cancelMktData(ticker.contract)
+
+    return positions_data

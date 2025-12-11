@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QMovie
-from ibkr_api import fetch_positions, submit_stop_loss_orders, get_market_statuses_for_all  # Import our separate IBKR module
+from ibkr_api import get_market_statuses_for_all, _submit_stop_loss_orders_internal, fetch_basic_positions, fetch_market_data_for_positions
 from ib_insync import IB, Future, Stock, Contract
 import pandas as pd
 
@@ -29,51 +29,141 @@ class DataWorker(QObject):
     Worker thread for fetching and processing all IBKR data.
     This runs in the background to keep the UI responsive.
     """
-    finished = pyqtSignal()
+    finished = pyqtSignal(str) # Pass stage name
     error = pyqtSignal(str)
-    data_ready = pyqtSignal(dict)
+    positions_ready = pyqtSignal(list)
+    market_data_ready = pyqtSignal(list)
+    atr_ready = pyqtSignal(dict)
+    orders_submitted = pyqtSignal(list)
+    
+    def __init__(self, atr_window, atr_ratios, highest_stop_losses):
+        super().__init__()
+        # Give worker access to the main window's methods and data
+        self.atr_window = atr_window
+        self.send_adaptive_stops = atr_window.send_adaptive_stops
+        self.atr_ratios = atr_ratios
+        self.highest_stop_losses = highest_stop_losses
+        self.stage = "initial"
+        self.positions_data = []
 
     def run(self):
-        """Main worker method"""
-        # Create and set a new asyncio event loop for this thread
+        """Main worker method, executes a specific stage."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
+        ib = IB()
         try:
-            # --- 1. Fetch Positions and Market Data ---
-            positions_data, connection_success = fetch_positions()
-            
-            if not connection_success:
-                raise ConnectionError("Failed to connect to IBKR.")
+            client_id = random.randint(100, 999)
+            ib.connect('127.0.0.1', 7497, clientId=client_id)
 
-            if not positions_data:
-                # Not an error, just no positions. Emit success with empty data.
-                self.data_ready.emit({
-                    'positions_data': [], 'connection_success': True,
-                    'market_statuses': {}, 'contract_details_map': {}
-                })
-                return
+            if self.stage == 'fetch_positions':
+                positions = ib.positions()
+                basic_positions = fetch_basic_positions(ib, positions)
+                self.positions_ready.emit(basic_positions)
 
-            # --- 2. Get Market Statuses ---
-            contract_details_map = {p['symbol']: p['contract_details'] for p in positions_data if 'contract_details' in p}
-            logging.info("Fetching market statuses for all symbols...")
-            market_statuses = get_market_statuses_for_all(contract_details_map)
+            elif self.stage == 'fetch_market_data':
+                enriched_positions = fetch_market_data_for_positions(ib, self.positions_data)
+                self.market_data_ready.emit(enriched_positions)
 
-            # --- 3. Package and Emit Data ---
-            result = {
-                'positions_data': positions_data,
-                'connection_success': True,
-                'market_statuses': market_statuses,
-                'contract_details_map': contract_details_map
-            }
-            self.data_ready.emit(result)
+            elif self.stage == 'calculate_atr':
+                contract_details_map = {p['symbol']: p['contract_details'] for p in self.positions_data}
+                market_statuses = get_market_statuses_for_all(contract_details_map)
+                self.atr_window.market_statuses = market_statuses # Update main window
+                
+                symbols = [p['symbol'] for p in self.positions_data]
+                atr_results = self.atr_window.calculate_atr_for_symbols(symbols, market_statuses, contract_details_map)
+                self.atr_ready.emit(atr_results)
+
+            elif self.stage == 'submit_orders':
+                if not self.send_adaptive_stops:
+                    logging.info("Adaptive stops are disabled, skipping order submission.")
+                    self.orders_submitted.emit([])
+                    return
+
+                stop_loss_data = self.build_stop_loss_data()
+                # stop_loss_data now contains both orders to submit and statuses for skipped items
+                final_results = stop_loss_data.get('statuses_only', [])
+                orders_to_submit = stop_loss_data.get('orders_to_submit', {})
+
+                if orders_to_submit:
+                    submission_results = _submit_stop_loss_orders_internal(ib, orders_to_submit)
+                    final_results.extend(submission_results)
+                    self.orders_submitted.emit(final_results)
+                else:
+                    logging.info("No new stop loss orders to submit.")
+                    self.orders_submitted.emit(final_results)
 
         except Exception as e:
             self.error.emit(str(e))
         finally:
-            self.finished.emit()
+            if ib.isConnected():
+                ib.disconnect()
+            self.finished.emit(self.stage)
             loop.close()
 
+    def build_stop_loss_data(self):
+        """Prepares the data structure for submitting stop loss orders."""
+        orders_to_submit = {}
+        statuses_only = []
+
+        for i, p_data in enumerate(self.positions_data):
+            symbol = p_data['symbol']
+            if self.atr_window.market_statuses.get(symbol) == 'CLOSED':
+                logging.info(f"Worker: Skipping stop loss for {symbol}: Market is closed.")
+                statuses_only.append({
+                    'symbol': symbol,
+                    'status': 'held',
+                    'message': 'Market Closed'
+                })
+                continue
+
+            atr_value = None
+            # Get the highest stop loss computed so far (the one ratcheting up)
+            highest_stop = self.atr_window.highest_stop_losses.get(symbol, 0)
+            # Get the current ATR ratio from the UI
+            atr_ratio = self.atr_ratios[i] if i < len(self.atr_ratios) else 1.5
+
+
+            if symbol in self.atr_window.atr_symbols:
+                try:
+                    atr_index = self.atr_window.atr_symbols.index(symbol)
+                    atr_value = self.atr_window.atr_calculated[atr_index]
+                except (ValueError, IndexError):
+                    pass
+
+            # This computes the *potential* new stop loss, without the ratcheting logic
+            potential_new_stop = self.atr_window.compute_stop_loss(
+                p_data,
+                p_data['current_price'],
+                atr_value,
+                atr_ratio,
+                apply_ratchet=False # We need the raw computed value to compare
+            )
+
+            if potential_new_stop <= 0:
+                logging.info(f"Worker: Skipping {symbol}: No valid stop price computed.")
+                statuses_only.append({
+                    'symbol': symbol,
+                    'status': 'error',
+                    'message': 'Invalid stop price computed'
+                })
+                continue
+
+            # Ratchet check: if the new stop is lower than the highest one, hold the order
+            if highest_stop > 0 and potential_new_stop < highest_stop:
+                logging.info(f"Worker: Holding stop for {symbol}. New stop {potential_new_stop:.2f} is lower than existing {highest_stop:.2f}")
+                statuses_only.append({
+                    'symbol': symbol,
+                    'status': 'held',
+                    'message': 'Stop Held'
+                })
+                continue
+
+            orders_to_submit[symbol] = {
+                'stop_price': potential_new_stop, # Use the new valid stop price
+                'quantity': p_data['positions_held'],
+                'contract_details': p_data['contract_details']
+            }
+        return {'orders_to_submit': orders_to_submit, 'statuses_only': statuses_only}
 
 class ATRWindow(QMainWindow):
     def __init__(self):
@@ -92,6 +182,7 @@ class ATRWindow(QMainWindow):
         self.current_prices = []
         self.multipliers = []
         self.computed_stop_losses = []  # Current computed stop losses
+        self.all_positions_details = [] # Store full position dictionaries
         self.highest_stop_losses = {}  # Track highest stop loss per symbol (never goes down)
         self.contract_details_map = {}  # Store contract details by symbol
         
@@ -232,11 +323,11 @@ class ATRWindow(QMainWindow):
         self.atr_table.cellChanged.connect(self.on_atr_changed)
         # Setup auto-refresh timer (60 seconds = 60000 ms)
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.start_data_fetch_thread)
+        self.refresh_timer.timeout.connect(self.start_full_refresh)
         self.refresh_timer.start(60000)  # Refresh every 60 seconds
         
         # Fetch data immediately on startup
-        self.start_data_fetch_thread()
+        self.start_full_refresh()
     
     def calculate_tr_and_atr(self, df, prior_atr, symbol=None):
         """
@@ -299,12 +390,24 @@ class ATRWindow(QMainWindow):
         # Formula: ATR = (Prior ATR × 13 + Current TR) / 14
         current_atr = (prior_atr * 13 + current_tr) / 14
 
+        # Fallback for when prior_atr is None (e.g., first run for a symbol)
+        if prior_atr is None:
+            logging.warning(f"No prior ATR for {symbol}. Calculating ATR from historical bars.")
+            try:
+                # Use the ib_insync utility to calculate ATR from the full bar series
+                atr_series = util.ATR(df['high'], df['low'], df['close'], 14)
+                if atr_series is not None and not atr_series.empty:
+                    current_atr = atr_series.iloc[-1] # Get the most recent ATR value
+            except Exception as e:
+                logging.error(f"Error during fallback ATR calculation for {symbol}: {e}")
+                return current_tr, None # Return None if fallback fails
         return current_tr, current_atr
 
     def populate_positions_table(self):
-        self.table.setRowCount(len(self.positions))
-        for i, pos in enumerate(self.positions):
-            symbol = self.symbols[i]
+        self.table.setRowCount(len(self.all_positions_details))
+        for i, p_data in enumerate(self.all_positions_details):
+            pos = p_data['position']
+            symbol = p_data['symbol']
             
             # Column 0: Position
             position_item = QTableWidgetItem(pos)
@@ -345,23 +448,23 @@ class ATRWindow(QMainWindow):
             self.table.setCellWidget(i, 2, spin)
 
             # Column 3: Positions Held
-            self.table.setItem(i, 3, QTableWidgetItem(str(self.positions_held[i])))
+            self.table.setItem(i, 3, QTableWidgetItem(str(p_data['positions_held'])))
             
             # Column 4: Current Price
-            self.table.setItem(i, 4, QTableWidgetItem(f"{self.current_prices[i]:.2f}"))
+            self.table.setItem(i, 4, QTableWidgetItem(f"{p_data['current_price']:.2f}"))
 
             # Column 5: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
             # Stop loss never goes down - use highest computed value
-            computed_stop = self.compute_stop_loss(symbol, self.current_prices[i], atr_value, self.atr_ratios[i])
+            computed_stop = self.compute_stop_loss(p_data, p_data['current_price'], atr_value, self.atr_ratios[i]) # self.atr_ratios is still correct by index
             stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
             self.table.setItem(i, 5, stop_item)
 
             # Column 6: $ Risk
             risk_value = 0
-            if computed_stop and self.current_prices[i] > 0:
-                risk_in_points = self.current_prices[i] - computed_stop
-                multiplier = self.multipliers[i]
-                risk_value = risk_in_points * multiplier
+            if computed_stop and p_data['current_price'] > 0:
+                risk_in_points = p_data['current_price'] - computed_stop
+                multiplier = p_data.get('multiplier', 1.0) # Get the contract multiplier
+                risk_value = risk_in_points * abs(p_data['positions_held']) * multiplier # Risk = (Price - Stop) * Quantity * Multiplier
             risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
             self.table.setItem(i, 6, risk_item)
 
@@ -379,28 +482,54 @@ class ATRWindow(QMainWindow):
             self.table.setItem(i, 7, percent_risk_item)
     
             # Column 8: Status
+            # Note: self.statuses[i] corresponds to the index of the symbol in self.symbols, not necessarily p_data
             self.table.setItem(i, 8, QTableWidgetItem(self.statuses[i]))
 
-    def compute_stop_loss(self, symbol, current_price, atr_value, atr_ratio):
+    def compute_stop_loss(self, position_data, current_price, atr_value, atr_ratio, apply_ratchet=True):
         """
         Compute stop loss = Current Price - (ATR × ATR Ratio)
-        Stop loss never goes down - track highest value per symbol
+        - Stop loss never goes down (ratchets up).
+        - Rounds to the contract's minimum tick size.
+        - Rounds down for long positions (SELL stop), up for short positions (BUY stop).
+        - `apply_ratchet` flag controls whether to enforce the "never goes down" rule.
         """
+        symbol = position_data['symbol']
+
         if atr_value is None or current_price <= 0:
             return self.highest_stop_losses.get(symbol, 0)
         
         # Calculate new stop loss
         new_stop = current_price - (atr_value * atr_ratio)
-        
+
+        # --- Round to minTick ---
+        contract_details = self.contract_details_map.get(symbol, {})
+        min_tick = contract_details.get('minTick', 0.01)  # Default to 0.01
+        quantity = position_data.get('positions_held', 0)
+
+        if min_tick > 0:
+            # For long positions (SELL stop), round down to be more conservative
+            if quantity > 0:
+                rounded_stop = (new_stop // min_tick) * min_tick
+            # For short positions (BUY stop), round up to be more conservative
+            elif quantity < 0:
+                rounded_stop = ((new_stop + min_tick - 1e-9) // min_tick) * min_tick # Add epsilon for precision
+            else: # No position
+                rounded_stop = new_stop
+        else:
+            rounded_stop = new_stop
+
         # Get previous highest stop loss for this symbol
         prev_highest = self.highest_stop_losses.get(symbol, 0)
         
-        # Stop loss never goes down - use max of new and previous
-        if new_stop > prev_highest:
-            self.highest_stop_losses[symbol] = new_stop
-            return new_stop
+        if apply_ratchet:
+            # Stop loss never goes down - use max of new and previous
+            if rounded_stop > prev_highest:
+                self.highest_stop_losses[symbol] = rounded_stop
+                return rounded_stop
+            else:
+                return prev_highest
         else:
-            return prev_highest
+            return rounded_stop # Return the raw computed value if not ratcheting
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
@@ -598,8 +727,12 @@ class ATRWindow(QMainWindow):
             # Create contract using actual details from position
             if contract_info.get('conId'):
                 # Use conId for most accurate contract identification
-                contract = Contract(conId=contract_info['conId'])
+                contract = Contract(
+                    conId=contract_info['conId'],
+                    exchange=contract_info.get('exchange', '') # Explicitly add exchange
+                )
                 ib.qualifyContracts(contract)
+                logging.info(f"Recalculating ATR for conId {contract.conId} on exchange '{contract.exchange}'")
             elif contract_info.get('lastTradeDateOrContractMonth'):
                 # Use actual expiration date from position
                 contract = Future(
@@ -660,106 +793,13 @@ class ATRWindow(QMainWindow):
         # Update checkbox text
         if self.send_adaptive_stops:
             self.adaptive_stop_toggle.setText("ON")
-            # Submit stop loss orders immediately when enabled
-            self.submit_adaptive_stop_losses()
+            # Trigger a data fetch and order submission cycle immediately when enabled
+            logging.info("Adaptive stops enabled. Triggering a full data refresh.")
+            self.start_data_fetch_thread()
         else:
             self.adaptive_stop_toggle.setText("OFF")
         status_text = "ENABLED" if self.send_adaptive_stops else "DISABLED"
         logging.info(f"Adaptive Stop Losses: {status_text}")
-    
-    def submit_adaptive_stop_losses(self):
-        """Submit stop loss orders for all positions based on computed stop losses"""
-        if not self.send_adaptive_stops:
-            print("Adaptive stop losses are disabled, skipping order submission")
-            return
-        
-        # Build stop loss data for each symbol
-        stop_loss_data = {}
-        
-        for i, symbol in enumerate(self.symbols):
-            # If market is closed, update status and skip order submission for this symbol
-            if self.market_statuses.get(symbol) == 'CLOSED':
-                self.statuses[i] = "Order Held - Market Closed"
-                logging.info(f"Skipping stop loss for {symbol}: Market is closed.")
-                continue
-            elif self.market_statuses.get(symbol) == 'UNKNOWN':
-                logging.warning(f"Market status for {symbol} is UNKNOWN. Will attempt to send order.")
-
-            # Get ATR value
-            atr_value = None
-            if symbol in self.atr_symbols:
-                atr_index = self.atr_symbols.index(symbol)
-                if self.atr_calculated[atr_index] is not None:
-                    atr_value = self.atr_calculated[atr_index]
-            
-            # Get computed stop loss (using the same logic as the table)
-            stop_price = self.compute_stop_loss(
-                symbol,
-                self.current_prices[i],
-                atr_value,
-                self.atr_ratios[i]
-            )
-            
-            # Get contract details
-            contract_details = self.contract_details_map.get(symbol, {})
-            
-            # Skip if no valid stop price
-            if stop_price <= 0:
-                print(f"Skipping {symbol}: No valid stop price computed")
-                continue
-            
-            # Skip stocks/ETFs if desired (uncomment to enable)
-            # if contract_details.get('secType') == 'STK':
-            #     print(f"Skipping {symbol}: Stock/ETF")
-            #     continue
-            
-            stop_loss_data[symbol] = {
-                'stop_price': stop_price,
-                'quantity': self.positions_held[i],
-                'contract_details': contract_details
-            }
-            
-            logging.info(f"Preparing stop loss for {symbol}: {self.positions_held[i]} @ {stop_price:.2f}")
-        
-        if not stop_loss_data:
-            print("No valid stop loss orders to submit")
-            # Refresh table to show "Market Closed" statuses even if no orders are sent
-            self.populate_positions_table()
-            return
-        
-        # Submit the stop loss orders
-        print(f"\nSubmitting {len(stop_loss_data)} stop loss order(s)...")
-        results, success = submit_stop_loss_orders(stop_loss_data)
-        
-        # Update status based on results
-        for result in results:
-            symbol = result.get('symbol', 'Unknown')
-            status = result.get('status', 'unknown')
-            
-            # Find the row for this symbol and update status
-            if symbol in self.symbols:
-                idx = self.symbols.index(symbol)
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                
-                if status in ['submitted', 'unchanged']:
-                    # For both new/modified orders and unchanged ones, show success
-                    self.statuses[idx] = f"Order Updated @ {timestamp}"
-                elif status in ['error', 'pending']:
-                    # For API errors or orders that don't get a success confirmation
-                    self.statuses[idx] = "Order Unsuccessful"
-                elif status == 'skipped' and self.statuses[idx] != "Order Held - Market Closed":
-                    # If skipped for a reason other than market closed (e.g., invalid price)
-                    self.statuses[idx] = f"Skipped: {result.get('message', '')}"
-                # If status is 'skipped' and market is closed, the status is already set and we do nothing.
-
-        
-        # Refresh the table to show updated statuses
-        self.populate_positions_table()
-        
-        if success:
-            logging.info("Stop loss orders submitted successfully")
-        else:
-            logging.warning("Some stop loss orders may have failed")
 
     def update_atr_ratio(self, row, value):
         self.atr_ratios[row] = value
@@ -780,12 +820,14 @@ class ATRWindow(QMainWindow):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.last_pull_time.setText(current_time)
 
-    def calculate_atr_for_symbols(self, symbols):
+    def calculate_atr_for_symbols(self, symbols, market_statuses, contract_details_map):
         """Calculate ATR for each symbol in the list"""
-        self.atr_symbols.clear()
-        self.tr_values.clear()
-        self.atr_calculated.clear()
-        self.previous_atr_values.clear()
+        # This function is now called by the worker, so it should not modify self directly
+        # but return the results.
+        atr_symbols = []
+        tr_values = []
+        atr_calculated = []
+        previous_atr_values = []
 
         ib = IB()
         try:
@@ -793,22 +835,22 @@ class ATRWindow(QMainWindow):
             
             for symbol in symbols:
                 try:
-                    # Check market status early to avoid unnecessary API calls for closed markets
-                    if self.market_statuses.get(symbol) == 'CLOSED':
+                    # Use the market statuses passed into the function
+                    if market_statuses.get(symbol) == 'CLOSED':
                         logging.info(f"Market for {symbol} is closed. Skipping ATR calculation and using last known value.")
                         previous_atr = self.get_previous_atr(symbol)
                         # When closed, current ATR is the same as the last known ATR, and TR is 0
-                        self.atr_symbols.append(symbol)
-                        self.tr_values.append(0) # No new candle, so TR is 0
-                        self.atr_calculated.append(previous_atr)
-                        self.previous_atr_values.append(previous_atr)
+                        atr_symbols.append(symbol)
+                        tr_values.append(0) # No new candle, so TR is 0
+                        atr_calculated.append(previous_atr)
+                        previous_atr_values.append(previous_atr)
                         continue # Move to the next symbol
 
                     # Get previous ATR from history
                     previous_atr = self.get_previous_atr(symbol)
                     
                     # Get contract details from position data if available
-                    contract_info = self.contract_details_map.get(symbol, {})
+                    contract_info = contract_details_map.get(symbol, {})
                     sec_type = contract_info.get('secType', 'FUT')
                     
                     # Skip stocks/ETFs for ATR calculation (they use different method)
@@ -818,10 +860,13 @@ class ATRWindow(QMainWindow):
                     
                     # Create contract using actual details from position
                     if contract_info.get('conId'):
-                        # Use conId for most accurate contract identification
-                        contract = Contract(conId=contract_info['conId'])
+                        # Use conId and exchange for most accurate contract identification
+                        contract = Contract(
+                            conId=contract_info['conId'],
+                            exchange=contract_info.get('exchange', '') # Explicitly add exchange
+                        )
                         ib.qualifyContracts(contract)
-                        logging.info(f"Using conId {contract_info['conId']} for {symbol}")
+                        logging.info(f"Using conId {contract_info['conId']} and exchange '{contract.exchange}' for {symbol}")
                     elif contract_info.get('lastTradeDateOrContractMonth'):
                         # Use actual expiration date from position
                         contract = Future(
@@ -916,10 +961,10 @@ class ATRWindow(QMainWindow):
 
                     
                     # Store the values
-                    self.atr_symbols.append(symbol)
-                    self.tr_values.append(current_tr)
-                    self.atr_calculated.append(current_atr)
-                    self.previous_atr_values.append(previous_atr)
+                    atr_symbols.append(symbol)
+                    tr_values.append(current_tr)
+                    atr_calculated.append(current_atr)
+                    previous_atr_values.append(previous_atr)
                 
                 except Exception as e:
                     print(f"Error calculating ATR for {symbol}: {e}")
@@ -931,84 +976,161 @@ class ATRWindow(QMainWindow):
             if ib.isConnected():
                 ib.disconnect()
         
-        # Update the ATR table
-        self.populate_atr_table()
-        
-        # Update the Positions table to show the new ATR values
-        self.populate_positions_table()
+        return {
+            'atr_symbols': atr_symbols,
+            'tr_values': tr_values,
+            'atr_calculated': atr_calculated,
+            'previous_atr_values': previous_atr_values
+        }
 
-    def start_data_fetch_thread(self):
-        """Creates and starts the worker thread for fetching data."""
+    def start_full_refresh(self):
+        """Starts the first stage of the data loading sequence."""
+        self.update_status(False) # Show as disconnected/refreshing
+        self.connection_status.setText("Refreshing...")
+        self.connection_status.setStyleSheet("color: orange; font-weight: bold;")
+        self.start_worker_stage('fetch_positions')
+
+    def start_worker_stage(self, stage, positions_data=None):
+        """Creates and starts a worker for a specific stage."""
         self.thread = QThread()
-        self.worker = DataWorker()
+        self.worker = DataWorker(self, self.atr_ratios, self.highest_stop_losses)
+        self.worker.stage = stage
+        if positions_data:
+            self.worker.positions_data = positions_data
+
         self.worker.moveToThread(self.thread)
 
-        # Connect signals and slots
         self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.on_worker_finished)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
-        self.worker.data_ready.connect(self.handle_data_ready)
         self.worker.error.connect(self.handle_data_error)
 
-        # Start the thread
+        # Connect stage-specific signals
+        if stage == 'fetch_positions':
+            self.worker.positions_ready.connect(self.handle_positions_ready)
+        elif stage == 'fetch_market_data':
+            self.worker.market_data_ready.connect(self.handle_market_data_ready)
+        elif stage == 'calculate_atr':
+            self.worker.atr_ready.connect(self.handle_atr_ready)
+        elif stage == 'submit_orders':
+            self.worker.orders_submitted.connect(self.handle_orders_submitted)
+
         self.thread.start()
-        logging.info("Data fetch thread started...")
+        logging.info(f"Worker started for stage: {stage}")
 
-    def handle_data_ready(self, result):
-        """Slot to handle the data once the worker is finished."""
-        logging.info("Data received from worker thread. Updating UI.")
-        positions_data = result['positions_data']
-        
-        self.update_status(result['connection_success'])
-        if result['connection_success']:
+    def on_worker_finished(self, stage):
+        """Called when any worker stage finishes. Triggers the next stage."""
+        # Ensure the thread is properly quit before we proceed.
+        if self.thread and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait() # Wait for the thread to fully terminate
+
+        logging.info(f"Worker finished stage: {stage}")
+
+        if stage == 'fetch_positions':
+            self.start_worker_stage('fetch_market_data', self.all_positions_details)
+        elif stage == 'fetch_market_data':
+            self.start_worker_stage('calculate_atr', self.all_positions_details)
+        elif stage == 'calculate_atr':
+            self.start_worker_stage('submit_orders', self.all_positions_details)
+        elif stage == 'submit_orders':
+            self.update_status(True)
             self.update_timestamp()
+            logging.info("All data loading stages complete.")
 
+    def handle_positions_ready(self, positions_data):
+        """Stage 1: Basic positions are ready. Populate table with what we have."""
+        logging.info(f"Stage 1 Complete: Received {len(positions_data)} basic positions.")
         if not positions_data:
             self.raw_data_view.setPlainText("No positions returned from IBKR")
-            # Clear tables if there are no positions
             self.table.setRowCount(0)
             self.atr_table.setRowCount(0)
             return
+        
+        self.update_ui_with_position_data(positions_data)
 
-        # Update internal data structures
-        self.market_statuses = result['market_statuses']
-        self.contract_details_map = result['contract_details_map']
+    def handle_market_data_ready(self, positions_data):
+        """Stage 2: Market data is ready. Repopulate table with prices."""
+        logging.info("Stage 2 Complete: Received market data.")
+        self.update_ui_with_position_data(positions_data)
 
-        # Clear old data
+    def handle_atr_ready(self, atr_results):
+        """Stage 3: ATR data is ready. Populate ATR table and update positions table."""
+        logging.info("Stage 3 Complete: Received ATR calculations.")
+        self.atr_symbols = atr_results.get('atr_symbols', [])
+        self.tr_values = atr_results.get('tr_values', [])
+        self.atr_calculated = atr_results.get('atr_calculated', [])
+        self.previous_atr_values = atr_results.get('previous_atr_values', [])
+        self.populate_atr_table()
+        self.populate_positions_table() # Re-populate to show ATR and computed stops
+
+    def handle_orders_submitted(self, order_results):
+        """Stage 4: Order submission is complete. Update statuses."""
+        logging.info("Stage 4 Complete: Processed order submissions.")
+        self.process_order_results(order_results)
+
+    def update_ui_with_position_data(self, positions_data):
+        """A helper to update UI state from a list of position data dicts."""
+        old_atr_ratios_map = {sym: ratio for sym, ratio in zip(self.symbols, self.atr_ratios)}
+
+        self.all_positions_details.clear()
         self.positions.clear()
-        self.atr_ratios.clear()
-        self.statuses.clear()
-        self.symbols.clear()
+        self.atr_ratios.clear() # Will be repopulated
+        self.statuses.clear() # Will be repopulated
+        self.symbols.clear() # Will be repopulated
         self.positions_held.clear()
         self.current_prices.clear()
         self.multipliers.clear()
 
         display_text = ""
         for p in positions_data:
+            self.all_positions_details.append(p)
             self.positions.append(p['position'])
-            self.atr_ratios.append(1.5)  # Default ATR Ratio
-            self.statuses.append("Up to date")
             self.symbols.append(p['symbol'])
             self.positions_held.append(p['positions_held'])
             self.current_prices.append(p['current_price'])
-            self.multipliers.append(p.get('multiplier', 1.0)) # Default to 1 if not present
+            self.multipliers.append(p.get('multiplier', 1.0))
+            self.contract_details_map[p['symbol']] = p['contract_details']
+
+            self.atr_ratios.append(old_atr_ratios_map.get(p['symbol'], 1.5))
+            self.statuses.append("Updating...")
             raw_line = f"{p['symbol']} | Qty: {p['positions_held']} | Avg Cost: ${p['avg_cost']:.2f} | Price: ${p['current_price']:.2f} | P/L: ${p.get('unrealized_pl', 0):.2f} ({p.get('pl_percent', 0):.2f}%)"
             display_text += raw_line + "\n"
 
         self.raw_data_view.setPlainText(display_text)
-        
-        # Now that the main data is loaded, calculate ATRs and submit orders
-        if self.symbols:
-            self.calculate_atr_for_symbols(self.symbols)
-        if self.send_adaptive_stops:
-            self.submit_adaptive_stop_losses()
+        self.populate_positions_table()
 
     def handle_data_error(self, error_message):
         """Slot to handle errors from the worker thread."""
         logging.error(f"Error in worker thread: {error_message}")
         self.raw_data_view.setPlainText(f"Error fetching data: {error_message}")
         self.update_status(False)
+
+    def process_order_results(self, results):
+        """Updates the UI based on the results of order submissions."""
+        if not results:
+            logging.info("No order submission results to process.")
+            return
+
+        for result in results:
+            symbol = result.get('symbol', 'Unknown')
+            status = result.get('status', 'unknown')
+            
+            if symbol in self.symbols:
+                idx = self.symbols.index(symbol)
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                message = result.get('message', 'Unknown')
+
+                if status in ['submitted', 'unchanged']:
+                    self.statuses[idx] = f"Order Updated - {timestamp}"
+                elif status == 'held':
+                    self.statuses[idx] = f"Order Held - {message}"
+                elif status == 'pending': # IBKR rejected or has non-final status
+                    self.statuses[idx] = f"Order Rejected - {message}"
+                elif status in ['error', 'skipped']:
+                    self.statuses[idx] = f"Error - {message}"
+        self.populate_positions_table()
 
 def main():
     app = QApplication(sys.argv)
