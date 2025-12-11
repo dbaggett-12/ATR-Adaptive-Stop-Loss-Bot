@@ -1,18 +1,20 @@
 # main.py
 import sys
+import asyncio
 import logging
 import random
 import json
 import os
 from datetime import datetime, timedelta, time
-from PyQt6 import QtGui
+from PyQt6 import QtGui, QtCore
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget, QDoubleSpinBox, QTabWidget, QTextEdit, QPushButton, QHeaderView,
+    QWidget, QDoubleSpinBox, QTabWidget, QTextEdit, QPushButton, QHeaderView, QAbstractSpinBox,
     QLabel, QHBoxLayout, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer
-from ibkr_api import fetch_positions, submit_stop_loss_orders  # Import our separate IBKR module
+from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
+from PyQt6.QtGui import QMovie
+from ibkr_api import fetch_positions, submit_stop_loss_orders, get_market_statuses_for_all  # Import our separate IBKR module
 from ib_insync import IB, Future, Stock, Contract
 import pandas as pd
 
@@ -21,6 +23,56 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Constants ---
 ATR_HISTORY_FILE = 'atr_history.json'
+
+class DataWorker(QObject):
+    """
+    Worker thread for fetching and processing all IBKR data.
+    This runs in the background to keep the UI responsive.
+    """
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    data_ready = pyqtSignal(dict)
+
+    def run(self):
+        """Main worker method"""
+        # Create and set a new asyncio event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            # --- 1. Fetch Positions and Market Data ---
+            positions_data, connection_success = fetch_positions()
+            
+            if not connection_success:
+                raise ConnectionError("Failed to connect to IBKR.")
+
+            if not positions_data:
+                # Not an error, just no positions. Emit success with empty data.
+                self.data_ready.emit({
+                    'positions_data': [], 'connection_success': True,
+                    'market_statuses': {}, 'contract_details_map': {}
+                })
+                return
+
+            # --- 2. Get Market Statuses ---
+            contract_details_map = {p['symbol']: p['contract_details'] for p in positions_data if 'contract_details' in p}
+            logging.info("Fetching market statuses for all symbols...")
+            market_statuses = get_market_statuses_for_all(contract_details_map)
+
+            # --- 3. Package and Emit Data ---
+            result = {
+                'positions_data': positions_data,
+                'connection_success': True,
+                'market_statuses': market_statuses,
+                'contract_details_map': contract_details_map
+            }
+            self.data_ready.emit(result)
+
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+            loop.close()
 
 
 class ATRWindow(QMainWindow):
@@ -38,6 +90,7 @@ class ATRWindow(QMainWindow):
         self.symbols = []
         self.positions_held = []
         self.current_prices = []
+        self.multipliers = []
         self.computed_stop_losses = []  # Current computed stop losses
         self.highest_stop_losses = {}  # Track highest stop loss per symbol (never goes down)
         self.contract_details_map = {}  # Store contract details by symbol
@@ -62,7 +115,8 @@ class ATRWindow(QMainWindow):
         self.user_submitted_atr = {}  # {symbol: timestamp_key}
         
         # Adaptive Stop Loss toggle state
-        self.send_adaptive_stops = False
+        self.send_adaptive_stops = True
+        self.market_statuses = {}  # {symbol: 'OPEN' | 'CLOSED' | 'UNKNOWN'}
 
         # Central widget & layout
         central_widget = QWidget()
@@ -86,12 +140,25 @@ class ATRWindow(QMainWindow):
         toggle_layout.addWidget(toggle_label)
         
         self.adaptive_stop_toggle = QCheckBox()
-        self.adaptive_stop_toggle.setChecked(False)
+        self.adaptive_stop_toggle.setChecked(True)
         self.adaptive_stop_toggle.stateChanged.connect(self.on_adaptive_stop_toggled)
-        self.adaptive_stop_toggle.setText("OFF")
+        self.adaptive_stop_toggle.setText("ON")
         toggle_layout.addWidget(self.adaptive_stop_toggle)
         
         status_layout.addWidget(toggle_container)
+        
+        # Add stretch to push GIF to the center
+        status_layout.addStretch()
+        
+        # --- Add GIF in the middle ---
+        self.gif_label = QLabel()
+        self.movie = QMovie("mambo-ume-usume.gif")
+        self.gif_label.setMovie(self.movie)
+        # Scale the GIF to 75% of its original size
+        self.movie.setScaledSize(QSize(111, 111))
+        self.movie.start()
+        self.gif_label.setFixedSize(QSize(111, 111))
+        status_layout.addWidget(self.gif_label)
         
         # Add stretch to push status to the right
         status_layout.addStretch()
@@ -127,13 +194,15 @@ class ATRWindow(QMainWindow):
         self.tabs.addTab(self.positions_tab, "Positions")
 
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(9)
         self.table.setHorizontalHeaderLabels([
-            "Position", "ATR", "ATR Ratio", "Status",
-            "Positions Held", "Current Price", "Computed Stop Loss"
+            "Position", "ATR", "ATR Ratio", "Positions Held",
+            "Current Price", "Computed Stop Loss", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionsMovable(True)
+        # Make the "Status" column (index 6) wider to accommodate text
+        self.table.setColumnWidth(8, 240)
         self.positions_layout.addWidget(self.table)
 
         # --- Raw Data Tab ---
@@ -160,13 +229,14 @@ class ATRWindow(QMainWindow):
         self.atr_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.atr_table.verticalHeader().setDefaultSectionSize(60)  # Increase row height for multi-line text
         self.atr_calc_layout.addWidget(self.atr_table)
+        self.atr_table.cellChanged.connect(self.on_atr_changed)
         # Setup auto-refresh timer (60 seconds = 60000 ms)
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.fetch_ibkr_data)
+        self.refresh_timer.timeout.connect(self.start_data_fetch_thread)
         self.refresh_timer.start(60000)  # Refresh every 60 seconds
         
         # Fetch data immediately on startup
-        self.fetch_ibkr_data()
+        self.start_data_fetch_thread()
     
     def calculate_tr_and_atr(self, df, prior_atr, symbol=None):
         """
@@ -198,31 +268,21 @@ class ATRWindow(QMainWindow):
         if len(df) < 2:
             return None, None
 
+        # Get a definitive market status instead of inferring it from price data
+        if symbol:
+            if self.market_statuses.get(symbol) == 'CLOSED':
+                logging.info(f"Market for {symbol} is CLOSED. Reusing previous ATR: {prior_atr:.2f}")
+                # We still calculate TR for display, but return the prior ATR
+                prev_close = df['close'].iloc[-2]
+                current_high = df['high'].iloc[-1]
+                current_low = df['low'].iloc[-1]
+                current_tr = max(current_high - current_low, abs(current_high - prev_close), abs(current_low - prev_close))
+                return current_tr, prior_atr
+
         # Calculate current TR
         prev_close = df['close'].iloc[-2]
         current_high = df['high'].iloc[-1]
         current_low = df['low'].iloc[-1]
-
-        # Check if market data is the same as previous calculation (market closure)
-        if symbol and symbol in self.last_market_data:
-            last_data = self.last_market_data[symbol]
-            if (last_data['high'] == current_high and 
-                last_data['low'] == current_low and 
-                last_data['prev_close'] == prev_close):
-                # Market data unchanged - reuse previous ATR (market likely closed)
-                print(f"Market data unchanged for {symbol} - reusing previous ATR: {prior_atr:.2f}")
-                current_tr = max(current_high - current_low, 
-                               abs(current_high - prev_close), 
-                               abs(current_low - prev_close))
-                return current_tr, prior_atr
-
-        # Store current market data for next comparison
-        if symbol:
-            self.last_market_data[symbol] = {
-                'high': current_high,
-                'low': current_low,
-                'prev_close': prev_close
-            }
 
         # True Range (current)
         tr1 = current_high - current_low
@@ -247,7 +307,21 @@ class ATRWindow(QMainWindow):
             symbol = self.symbols[i]
             
             # Column 0: Position
-            self.table.setItem(i, 0, QTableWidgetItem(pos))
+            position_item = QTableWidgetItem(pos)
+            market_status = self.market_statuses.get(symbol, 'UNKNOWN')
+
+            # Create a colored circle icon
+            pixmap = QtGui.QPixmap(16, 16)
+            if market_status == 'OPEN':
+                pixmap.fill(Qt.GlobalColor.green)
+            elif market_status == 'CLOSED':
+                pixmap.fill(Qt.GlobalColor.blue)
+            else:  # UNKNOWN or other
+                pixmap.fill(Qt.GlobalColor.gray)
+            
+            icon = QtGui.QIcon(pixmap)
+            position_item.setIcon(icon)
+            self.table.setItem(i, 0, position_item)
             
             # Column 1: ATR - Get ATR value from ATR calculations tab
             atr_value = None
@@ -266,24 +340,47 @@ class ATRWindow(QMainWindow):
             spin.setSingleStep(0.1)
             spin.setDecimals(1)
             spin.setValue(self.atr_ratios[i])
+            spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
             spin.valueChanged.connect(lambda val, row=i: self.update_atr_ratio(row, val))
             self.table.setCellWidget(i, 2, spin)
 
-            # Column 3: Status
-            self.table.setItem(i, 3, QTableWidgetItem(self.statuses[i]))
+            # Column 3: Positions Held
+            self.table.setItem(i, 3, QTableWidgetItem(str(self.positions_held[i])))
             
-            # Column 4: Positions Held
-            self.table.setItem(i, 4, QTableWidgetItem(str(self.positions_held[i])))
-            
-            # Column 5: Current Price
-            self.table.setItem(i, 5, QTableWidgetItem(f"{self.current_prices[i]:.2f}"))
+            # Column 4: Current Price
+            self.table.setItem(i, 4, QTableWidgetItem(f"{self.current_prices[i]:.2f}"))
 
-            # Column 6: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
+            # Column 5: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
             # Stop loss never goes down - use highest computed value
             computed_stop = self.compute_stop_loss(symbol, self.current_prices[i], atr_value, self.atr_ratios[i])
             stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
-            self.table.setItem(i, 6, stop_item)
+            self.table.setItem(i, 5, stop_item)
+
+            # Column 6: $ Risk
+            risk_value = 0
+            if computed_stop and self.current_prices[i] > 0:
+                risk_in_points = self.current_prices[i] - computed_stop
+                multiplier = self.multipliers[i]
+                risk_value = risk_in_points * multiplier
+            risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
+            self.table.setItem(i, 6, risk_item)
+
+            # Column 7: % Risk
+            hypothetical_account_value = 6000.0
+            percent_risk = 0.0
+            if hypothetical_account_value > 0:
+                percent_risk = (risk_value / hypothetical_account_value) * 100
+            percent_risk_item = QTableWidgetItem(f"{percent_risk:.2f}%")
+            
+            # Turn the text red if risk is over 2%
+            if percent_risk > 2.0:
+                percent_risk_item.setForeground(QtGui.QColor('red'))
+
+            self.table.setItem(i, 7, percent_risk_item)
     
+            # Column 8: Status
+            self.table.setItem(i, 8, QTableWidgetItem(self.statuses[i]))
+
     def compute_stop_loss(self, symbol, current_price, atr_value, atr_ratio):
         """
         Compute stop loss = Current Price - (ATR × ATR Ratio)
@@ -307,6 +404,9 @@ class ATRWindow(QMainWindow):
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
+        # Temporarily disconnect the signal to prevent it from firing during population
+        self.atr_table.cellChanged.disconnect(self.on_atr_changed)
+
         self.atr_table.setRowCount(len(self.atr_symbols))
         for i in range(len(self.atr_symbols)):
             # Symbol (read-only)
@@ -331,6 +431,9 @@ class ATRWindow(QMainWindow):
             # ATR (editable)
             atr_item = QTableWidgetItem(f"{self.atr_calculated[i]:.2f}" if self.atr_calculated[i] is not None else "N/A")
             self.atr_table.setItem(i, 3, atr_item)
+
+        # Reconnect the signal
+        self.atr_table.cellChanged.connect(self.on_atr_changed)
 
     def load_atr_history(self):
         """Load ATR history from JSON file"""
@@ -456,6 +559,33 @@ class ATRWindow(QMainWindow):
         
         self.save_atr_history()
 
+    def on_atr_changed(self, row, column):
+        """Handle when a user manually edits the ATR value."""
+        if column == 3:  # "ATR (14)" column
+            item = self.atr_table.item(row, column)
+            if not item:
+                return
+
+            try:
+                new_atr_value = float(item.text())
+                symbol = self.atr_table.item(row, 0).text()
+
+                # Update the internal data structure
+                self.atr_calculated[row] = new_atr_value
+
+                # Save the user-inputted value to history for the current interval
+                logging.info(f"User manually set ATR for {symbol} to {new_atr_value:.2f}")
+                self.save_today_atr(symbol, new_atr_value)
+
+                # Repopulate the positions table to update computed stop loss
+                self.populate_positions_table()
+
+            except ValueError:
+                logging.warning(f"Invalid input for ATR: '{item.text()}'. Please enter a number.")
+                # Optionally, revert to the old value or show an error
+                if self.atr_calculated[row] is not None:
+                    item.setText(f"{self.atr_calculated[row]:.2f}")
+
     def recalculate_single_symbol_atr(self, row, symbol, prior_atr):
         """Recalculate ATR for a single symbol with the given prior ATR"""
         ib = IB()
@@ -547,6 +677,14 @@ class ATRWindow(QMainWindow):
         stop_loss_data = {}
         
         for i, symbol in enumerate(self.symbols):
+            # If market is closed, update status and skip order submission for this symbol
+            if self.market_statuses.get(symbol) == 'CLOSED':
+                self.statuses[i] = "Order Held - Market Closed"
+                logging.info(f"Skipping stop loss for {symbol}: Market is closed.")
+                continue
+            elif self.market_statuses.get(symbol) == 'UNKNOWN':
+                logging.warning(f"Market status for {symbol} is UNKNOWN. Will attempt to send order.")
+
             # Get ATR value
             atr_value = None
             if symbol in self.atr_symbols:
@@ -585,6 +723,8 @@ class ATRWindow(QMainWindow):
         
         if not stop_loss_data:
             print("No valid stop loss orders to submit")
+            # Refresh table to show "Market Closed" statuses even if no orders are sent
+            self.populate_positions_table()
             return
         
         # Submit the stop loss orders
@@ -599,12 +739,19 @@ class ATRWindow(QMainWindow):
             # Find the row for this symbol and update status
             if symbol in self.symbols:
                 idx = self.symbols.index(symbol)
-                if status == 'submitted':
-                    self.statuses[idx] = f"Stop @ {result.get('stop_price', 0):.2f}"
-                elif status == 'error':
-                    self.statuses[idx] = f"Error: {result.get('message', 'Unknown')}"
-                elif status == 'skipped':
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                
+                if status in ['submitted', 'unchanged']:
+                    # For both new/modified orders and unchanged ones, show success
+                    self.statuses[idx] = f"Order Updated @ {timestamp}"
+                elif status in ['error', 'pending']:
+                    # For API errors or orders that don't get a success confirmation
+                    self.statuses[idx] = "Order Unsuccessful"
+                elif status == 'skipped' and self.statuses[idx] != "Order Held - Market Closed":
+                    # If skipped for a reason other than market closed (e.g., invalid price)
                     self.statuses[idx] = f"Skipped: {result.get('message', '')}"
+                # If status is 'skipped' and market is closed, the status is already set and we do nothing.
+
         
         # Refresh the table to show updated statuses
         self.populate_positions_table()
@@ -639,13 +786,24 @@ class ATRWindow(QMainWindow):
         self.tr_values.clear()
         self.atr_calculated.clear()
         self.previous_atr_values.clear()
-        
+
         ib = IB()
         try:
             ib.connect('127.0.0.1', 7497, clientId=random.randint(100, 999))
             
             for symbol in symbols:
                 try:
+                    # Check market status early to avoid unnecessary API calls for closed markets
+                    if self.market_statuses.get(symbol) == 'CLOSED':
+                        logging.info(f"Market for {symbol} is closed. Skipping ATR calculation and using last known value.")
+                        previous_atr = self.get_previous_atr(symbol)
+                        # When closed, current ATR is the same as the last known ATR, and TR is 0
+                        self.atr_symbols.append(symbol)
+                        self.tr_values.append(0) # No new candle, so TR is 0
+                        self.atr_calculated.append(previous_atr)
+                        self.previous_atr_values.append(previous_atr)
+                        continue # Move to the next symbol
+
                     # Get previous ATR from history
                     previous_atr = self.get_previous_atr(symbol)
                     
@@ -720,11 +878,26 @@ class ATRWindow(QMainWindow):
                     last_bar_time = bars[-1].date
                     completed_interval_key = self.get_15min_interval_key(last_bar_time)
                     
+                    # Check if the user has already manually entered an ATR for this interval
+                    if (symbol in self.atr_history and 
+                        completed_interval_key in self.atr_history[symbol] and
+                        symbol in self.atr_symbols):
+                        # If a manual edit happened, the value in atr_calculated is the source of truth
+                        atr_index = self.atr_symbols.index(symbol)
+                        current_atr = self.atr_calculated[atr_index]
+                        logging.info(f"User-edited ATR for {symbol} exists for interval {completed_interval_key}. Using value: {current_atr:.2f}")
+
+
                     # Check if ATR already exists for this completed interval
-                    if symbol in self.atr_history and completed_interval_key in self.atr_history[symbol]:
+                    elif symbol in self.atr_history and completed_interval_key in self.atr_history[symbol]:
                         # ATR already calculated for this completed interval - use existing value
                         current_atr = self.atr_history[symbol][completed_interval_key]
                         logging.info(f"Symbol: {symbol}, ATR already calculated for completed interval {completed_interval_key}: {current_atr:.2f} (skipping calculation)")
+                        # Even if we skip calculation, ensure the value is saved for this interval if it's somehow missing
+                        if completed_interval_key not in self.atr_history.get(symbol, {}):
+                            self.atr_history[symbol][completed_interval_key] = current_atr
+                            self.save_atr_history()
+
                     elif previous_atr is not None:
                         # Calculate new ATR for the completed interval
                         tr, current_atr = self.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
@@ -736,6 +909,11 @@ class ATRWindow(QMainWindow):
                             self.atr_history[symbol] = {}
                         self.atr_history[symbol][completed_interval_key] = current_atr
                         self.save_atr_history()
+                    else:
+                        # If there's no previous ATR, we can't calculate a new one.
+                        current_atr = None
+                        logging.warning(f"Symbol: {symbol}, TR: {current_tr:.2f}, ATR: N/A (No previous ATR from 15-min interval)")
+
                     
                     # Store the values
                     self.atr_symbols.append(symbol)
@@ -759,131 +937,84 @@ class ATRWindow(QMainWindow):
         # Update the Positions table to show the new ATR values
         self.populate_positions_table()
 
-    def fetch_ibkr_data(self):
-        try:
-            positions_data, connection_success = fetch_positions()
-            
-            # Update connection status
-            self.update_status(connection_success)
-            
-            if connection_success:
-                # Update timestamp on successful connection
-                self.update_timestamp()
-            
-            if not positions_data:
-                self.raw_data_view.setPlainText("No positions returned from IBKR")
-                return
+    def start_data_fetch_thread(self):
+        """Creates and starts the worker thread for fetching data."""
+        self.thread = QThread()
+        self.worker = DataWorker()
+        self.worker.moveToThread(self.thread)
 
-            # Clear old data (but preserve highest_stop_losses - they never reset)
-            self.positions.clear()
-            self.atr_values.clear()
-            self.atr_ratios.clear()
-            self.statuses.clear()
-            self.symbols.clear()
-            self.positions_held.clear()
-            self.current_prices.clear()
-            self.computed_stop_losses.clear()
+        # Connect signals and slots
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.worker.data_ready.connect(self.handle_data_ready)
+        self.worker.error.connect(self.handle_data_error)
 
-            display_text = ""
-            self.contract_details_map.clear()
-            for p in positions_data:
-                self.positions.append(p['position'])
-                self.atr_values.append(0)
-                self.atr_ratios.append(2.5)  # Default ATR Ratio is now 2.5
-                self.statuses.append("Up to date")
-                self.symbols.append(p['symbol'])
-                self.positions_held.append(p['positions_held'])
-                self.current_prices.append(p['current_price'])
-                self.computed_stop_losses.append(0)
-                # Store contract details for ATR calculations
-                if 'contract_details' in p:
-                    self.contract_details_map[p['symbol']] = p['contract_details']
-                # Build raw line for display
-                raw_line = f"{p['symbol']} | Qty: {p['positions_held']} | Avg Cost: ${p['avg_cost']:.2f} | Price: ${p['current_price']:.2f} | P/L: ${p.get('unrealized_pl', 0):.2f} ({p.get('pl_percent', 0):.2f}%)"
-                display_text += raw_line + "\n"
+        # Start the thread
+        self.thread.start()
+        logging.info("Data fetch thread started...")
 
-            self.raw_data_view.setPlainText(display_text)
-            self.populate_positions_table()
-            
-            # Calculate ATR for all symbols if we have positions
-            if self.symbols:
-                self.calculate_atr_for_symbols(self.symbols)
-            
-            # Submit stop loss orders if adaptive stops are enabled
-            if self.send_adaptive_stops:
-                self.submit_adaptive_stop_losses()
+    def handle_data_ready(self, result):
+        """Slot to handle the data once the worker is finished."""
+        logging.info("Data received from worker thread. Updating UI.")
+        positions_data = result['positions_data']
+        
+        self.update_status(result['connection_success'])
+        if result['connection_success']:
+            self.update_timestamp()
 
-        except Exception as e:
-            self.raw_data_view.setPlainText(f"Error fetching data: {e}")
-            self.update_status(False)
+        if not positions_data:
+            self.raw_data_view.setPlainText("No positions returned from IBKR")
+            # Clear tables if there are no positions
+            self.table.setRowCount(0)
+            self.atr_table.setRowCount(0)
+            return
 
+        # Update internal data structures
+        self.market_statuses = result['market_statuses']
+        self.contract_details_map = result['contract_details_map']
 
-if __name__ == "__main__":
+        # Clear old data
+        self.positions.clear()
+        self.atr_ratios.clear()
+        self.statuses.clear()
+        self.symbols.clear()
+        self.positions_held.clear()
+        self.current_prices.clear()
+        self.multipliers.clear()
+
+        display_text = ""
+        for p in positions_data:
+            self.positions.append(p['position'])
+            self.atr_ratios.append(1.5)  # Default ATR Ratio
+            self.statuses.append("Up to date")
+            self.symbols.append(p['symbol'])
+            self.positions_held.append(p['positions_held'])
+            self.current_prices.append(p['current_price'])
+            self.multipliers.append(p.get('multiplier', 1.0)) # Default to 1 if not present
+            raw_line = f"{p['symbol']} | Qty: {p['positions_held']} | Avg Cost: ${p['avg_cost']:.2f} | Price: ${p['current_price']:.2f} | P/L: ${p.get('unrealized_pl', 0):.2f} ({p.get('pl_percent', 0):.2f}%)"
+            display_text += raw_line + "\n"
+
+        self.raw_data_view.setPlainText(display_text)
+        
+        # Now that the main data is loaded, calculate ATRs and submit orders
+        if self.symbols:
+            self.calculate_atr_for_symbols(self.symbols)
+        if self.send_adaptive_stops:
+            self.submit_adaptive_stop_losses()
+
+    def handle_data_error(self, error_message):
+        """Slot to handle errors from the worker thread."""
+        logging.error(f"Error in worker thread: {error_message}")
+        self.raw_data_view.setPlainText(f"Error fetching data: {error_message}")
+        self.update_status(False)
+
+def main():
     app = QApplication(sys.argv)
     window = ATRWindow()
     window.show()
     sys.exit(app.exec())
 
-
-
-
-
-
-
-
-
-#_______________________________________________________
-
-
-#WatchDog
-
-
-
-
-import os
-import sys
-import time
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import subprocess
-
-class ReloadHandler(FileSystemEventHandler):
-    def __init__(self, script_path):
-        self.script_path = script_path
-        self.process = None
-        self.start_process()
-
-    def start_process(self):
-        """Start the main.py process"""
-        if self.process:
-            self.process.terminate()
-            self.process.wait()
-        print(f"Starting {self.script_path}...")
-        self.process = subprocess.Popen([sys.executable, self.script_path])
-
-    def on_modified(self, event):
-        """Restart process if a Python file is modified"""
-        if event.src_path.endswith(".py"):
-            print(f"{event.src_path} changed — restarting...")
-            self.start_process()
-
 if __name__ == "__main__":
-    project_root = os.path.dirname(os.path.abspath(__file__))  # watch current folder
-    main_script = os.path.join(project_root, "main.py")
-
-    event_handler = ReloadHandler(main_script)
-    observer = Observer()
-    observer.schedule(event_handler, path=project_root, recursive=True)
-    observer.start()
-
-    print(f"Watching all Python files in {project_root}...")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Stopping WatchDog...")
-        observer.stop()
-        if event_handler.process:
-            event_handler.process.terminate()
-    observer.join()
+    main()

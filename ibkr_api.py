@@ -2,7 +2,9 @@ from ib_insync import IB, util, Contract, StopOrder
 from time import sleep
 import random
 import math
-
+from datetime import datetime
+import logging
+import pytz
 
 def fetch_positions():
     """
@@ -195,10 +197,15 @@ def submit_stop_loss_orders(stop_loss_data):
             ib.connect('127.0.0.1', 7497, clientId=client_id)
             print(f"Successfully connected with clientId {client_id}")
             
-            # Get all open orders
-            open_orders = ib.openOrders()
-            print(f"Found {len(open_orders)} open orders")
-            
+            # Get all open trades and create a map of symbol to existing stop order
+            open_trades = ib.openTrades()
+            existing_stop_orders = {}
+            for trade in open_trades:
+                # Ensure it's a Stop order
+                if trade.order.orderType == 'STP':
+                    existing_stop_orders[trade.contract.symbol] = trade
+            print(f"Found {len(existing_stop_orders)} existing stop orders.")
+
             for symbol, data in stop_loss_data.items():
                 try:
                     stop_price = data.get('stop_price', 0)
@@ -238,18 +245,6 @@ def submit_stop_loss_orders(stop_loss_data):
                         })
                         continue
                     
-                    # Cancel existing orders for this symbol
-                    cancelled_count = 0
-                    for trade in ib.openTrades():
-                        if trade.contract.symbol == symbol:
-                            print(f"Cancelling existing order for {symbol}: {trade.order.orderId}")
-                            ib.cancelOrder(trade.order)
-                            cancelled_count += 1
-                    
-                    if cancelled_count > 0:
-                        print(f"Cancelled {cancelled_count} existing order(s) for {symbol}")
-                        ib.sleep(0.5)  # Wait for cancellations to process
-                    
                     # Determine order action based on position
                     # For long positions (quantity > 0), we SELL to close
                     # For short positions (quantity < 0), we BUY to close
@@ -259,21 +254,40 @@ def submit_stop_loss_orders(stop_loss_data):
                     else:
                         action = 'BUY'
                         order_quantity = abs(quantity)
-                    
-                    # Create stop loss order
-                    stop_order = StopOrder(
-                        action=action,
-                        totalQuantity=order_quantity,
-                        stopPrice=round(stop_price, 2),
-                        tif='GTC'  # Good Till Cancelled
-                    )
-                    
-                    print(f"Submitting {action} STOP order for {symbol}: {order_quantity} @ {stop_price:.2f}")
-                    
-                    # Place the order using EClient.placeOrder (via ib_insync wrapper)
+
+                    # Check if an order already exists for this symbol
+                    existing_trade = existing_stop_orders.get(symbol)
+
+                    if existing_trade:
+                        # An order exists, check if modification is needed
+                        existing_order = existing_trade.order
+                        if existing_order.stopPrice == round(stop_price, 2):
+                            print(f"No change needed for {symbol}: Stop price is already {stop_price:.2f}")
+                            results.append({'symbol': symbol, 'status': 'unchanged', 'message': 'Stop price is already correct.'})
+                            continue
+                        else:
+                            # Modify the existing order
+                            print(f"Modifying {symbol} stop order from {existing_order.stopPrice} to {stop_price:.2f}")
+                            stop_order = existing_order
+                            stop_order.stopPrice = round(stop_price, 2)
+                    else:
+                        # No order exists, create a new one
+                        print(f"Creating new {action} STOP order for {symbol}: {order_quantity} @ {stop_price:.2f}")
+                        stop_order = StopOrder(
+                            action=action,
+                            totalQuantity=order_quantity,
+                            stopPrice=round(stop_price, 2),
+                            tif='GTC'  # Good Till Cancelled
+                        )
+
+                    # Place the new or modified order
                     trade = ib.placeOrder(contract, stop_order)
                     
-                    # Wait for order to reach PendingSubmit or better status
+                    # --- Wait for order status to confirm submission ---
+                    # This logic remains the same for both new and modified orders.
+                    # It ensures we wait for IBKR to acknowledge the request.
+                    
+                    # Wait for order to reach a stable state (submitted or rejected)
                     # Valid statuses: PendingSubmit, PreSubmitted, Submitted, Filled
                     valid_statuses = ['PendingSubmit', 'PreSubmitted', 'Submitted', 'Filled', 'ApiPending']
                     max_wait = 10  # Maximum wait time in seconds
@@ -307,7 +321,7 @@ def submit_stop_loss_orders(stop_loss_data):
                             'quantity': order_quantity,
                             'stop_price': stop_price,
                             'order_status': final_status,
-                            'cancelled_orders': cancelled_count
+                            'message': 'Order submitted successfully.'
                         })
                     else:
                         print(f"WARNING: {symbol} order may not have been accepted - Status: {final_status}")
@@ -319,7 +333,6 @@ def submit_stop_loss_orders(stop_loss_data):
                             'quantity': order_quantity,
                             'stop_price': stop_price,
                             'order_status': final_status,
-                            'cancelled_orders': cancelled_count,
                             'message': f'Order status: {final_status}'
                         })
                     
@@ -354,3 +367,72 @@ def submit_stop_loss_orders(stop_loss_data):
                 ib.disconnect()
     
     return results, success
+
+def get_market_statuses_for_all(contracts_info):
+    """
+    Checks the market status for a batch of contracts in a single connection.
+
+    Args:
+        contracts_info (dict): A dictionary mapping symbol to contract details dict.
+
+    Returns:
+        dict: A dictionary mapping symbol to its market status ('OPEN', 'CLOSED', 'UNKNOWN').
+    """
+    ib = IB()
+    statuses = {symbol: 'UNKNOWN' for symbol in contracts_info}
+    
+    try:
+        client_id = random.randint(100, 999)
+        ib.connect('127.0.0.1', 7497, clientId=client_id, timeout=5)
+
+        for symbol, details in contracts_info.items():
+            con_id = details.get('conId')
+            if not con_id:
+                continue
+
+            try:
+                contract = Contract(conId=con_id)
+                cds = ib.reqContractDetails(contract)
+                
+                if not cds:
+                    continue
+
+                cd = cds[0]
+                trading_hours_str = cd.liquidHours or cd.tradingHours
+                time_zone_id = cd.timeZoneId
+
+                if not trading_hours_str or not time_zone_id:
+                    continue
+
+                tz = pytz.timezone(time_zone_id)
+                now = datetime.now(tz)
+                
+                is_open = False
+                sessions = trading_hours_str.split(';')
+                for session in sessions:
+                    if 'CLOSED' in session or not session:
+                        continue
+                    
+                    # Format is YYYYMMDD:HHMM
+                    parts = session.split('-')
+                    if len(parts) != 2: continue
+                    start_str, end_str = parts
+                    
+                    start_dt = datetime.strptime(start_str, '%Y%m%d:%H%M').astimezone(tz)
+                    end_dt = datetime.strptime(end_str, '%Y%m%d:%H%M').astimezone(tz)
+
+                    if start_dt <= now < end_dt:
+                        is_open = True
+                        break
+                
+                statuses[symbol] = 'OPEN' if is_open else 'CLOSED'
+            except Exception as e:
+                logging.error(f"Error checking market status for {symbol}: {e}")
+
+    except Exception as e:
+        logging.error(f"Error checking market status: {e}")
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+            
+    return statuses
