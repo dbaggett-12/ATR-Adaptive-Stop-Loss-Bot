@@ -5,7 +5,7 @@ import logging
 import random
 import json
 import os
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from PyQt6 import QtGui, QtCore
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -16,6 +16,7 @@ from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QMovie
 from ibkr_api import get_market_statuses_for_all, _submit_stop_loss_orders_internal, fetch_basic_positions, fetch_market_data_for_positions
 from ib_insync import IB, Future, Stock, Contract
+import math
 import pandas as pd
 
 # --- Setup Logging ---
@@ -23,6 +24,134 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Constants ---
 ATR_HISTORY_FILE = 'atr_history.json'
+
+# --- Contract Metadata ---
+# Per-contract point values: dollar value per 1.00 displayed price move
+# For contracts quoted in cents (agricultural), this is the dollar value per 1 cent move
+# This ensures accurate dollar risk calculations across all contract types
+CONTRACT_POINT_VALUES = {
+    # Standard Index Futures
+    'ES': 50.0,      # E-mini S&P 500: $50 per point
+    'NQ': 20.0,      # E-mini Nasdaq: $20 per point
+    'YM': 5.0,       # E-mini Dow: $5 per point
+    'RTY': 50.0,     # E-mini Russell 2000: $50 per point
+    
+    # Micro Index Futures
+    'MES': 5.0,      # Micro E-mini S&P 500: $5 per point
+    'MNQ': 2.0,      # Micro E-mini Nasdaq: $2 per point
+    'MYM': 0.50,     # Micro E-mini Dow: $0.50 per point
+    'M2K': 5.0,      # Micro E-mini Russell 2000: $5 per point
+    
+    # Treasury Futures
+    'ZN': 1000.0,    # 10-Year T-Note: $1000 per point
+    'ZB': 1000.0,    # 30-Year T-Bond: $1000 per point
+    'ZF': 1000.0,    # 5-Year T-Note: $1000 per point
+    'ZT': 2000.0,    # 2-Year T-Note: $2000 per point
+    
+    # Micro Treasury Futures
+    'MZN': 100.0,    # Micro 10-Year Yield: $100 per point (10 × $10)
+    '10Y': 1000.0,   # Micro 10-Year Yield: $1000 per 1.00 point move in yield
+    '2YY': 2000.0,   # Micro 2-Year Yield: $2000 per 1.00 point move in yield
+    '30Y': 1000.0,   # Micro 30-Year Yield: $1000 per 1.00 point move in yield
+    
+    # Agricultural Futures (prices displayed in cents, e.g., 450.25 = 450.25 cents/bushel)
+    # Point value = contract size (bushels/lbs) × $0.01 per cent
+    # A 1.00 displayed price move = 1 cent = point_value dollars
+    'ZC': 50.0,      # Corn: 5000 bushels × $0.01 = $50 per 1 cent (1.00 displayed)
+    'ZS': 50.0,      # Soybeans: 5000 bushels × $0.01 = $50 per 1 cent
+    'ZW': 50.0,      # Wheat: 5000 bushels × $0.01 = $50 per 1 cent
+    'ZM': 100.0,     # Soybean Meal: 100 tons × $1.00 = $100 per point (quoted in $/ton)
+    'ZL': 600.0,     # Soybean Oil: 60000 lbs × $0.01 = $600 per 1 cent move
+    'HE': 400.0,     # Lean Hogs: 40000 lbs × $0.01 = $400 per 1 cent move
+    'LE': 400.0,     # Live Cattle: 40000 lbs × $0.01 = $400 per 1 cent move
+    'GF': 500.0,     # Feeder Cattle: 50000 lbs × $0.01 = $500 per 1 cent move
+    
+    # Micro Agricultural Futures (1/10th of standard)
+    'MZC': 5.0,      # Micro Corn: 500 bushels × $0.01 = $5 per 1 cent move
+    'MZS': 10.0,     # Micro Soybeans: 1000 bushels × $0.01 = $10 per 1 cent move
+    'MZW': 5.0,      # Micro Wheat: 500 bushels × $0.01 = $5 per 1 cent move
+    'MZM': 10.0,     # Micro Soybean Meal: 10 tons × $1.00 = $10 per point
+    'MZL': 60.0,     # Micro Soybean Oil: 6000 lbs × $0.01 = $60 per 1 cent move
+    
+    # Metals
+    'GC': 100.0,     # Gold: 100 oz × $1.00 = $100 per point
+    'SI': 5000.0,    # Silver: 5000 oz × $1.00 = $5000 per point
+    'HG': 250.0,     # Copper: 25000 lbs × $0.01 = $250 per 1 cent (prices in cents/lb)
+    'PL': 50.0,      # Platinum: 50 oz × $1.00 = $50 per point
+    
+    # Micro Metals
+    'MGC': 10.0,     # Micro Gold: 10 oz × $1.00 = $10 per point
+    'SIL': 1000.0,   # Micro Silver: 1000 oz × $1.00 = $1000 per point
+    'MHG': 25.0,     # Micro Copper: 2500 lbs × $0.01 = $25 per 1 cent (1/10th of HG)
+    
+    # Energy
+    'CL': 1000.0,    # Crude Oil: 1000 barrels × $1.00 = $1000 per point
+    'NG': 10000.0,   # Natural Gas: 10000 MMBtu × $1.00 = $10000 per point
+    'RB': 420.0,     # RBOB Gasoline: 42000 gallons × $0.01 = $420 per 1 cent
+    'HO': 420.0,     # Heating Oil: 42000 gallons × $0.01 = $420 per 1 cent
+    
+    # Micro Energy
+    'MCL': 100.0,    # Micro Crude Oil: 100 barrels × $1.00 = $100 per point
+    'MNG': 1000.0,   # Micro Natural Gas: 1000 MMBtu × $1.00 = $1000 per point
+    
+    # Currency Futures
+    'EUR': 125000.0, # Euro FX: 125000 EUR × $1.00 = $125000 per point
+    '6E': 125000.0,  # Euro FX (CME symbol): same as EUR
+    '6J': 12500000.0,# Japanese Yen: 12500000 JPY × $0.000001 = $12.50 per tick
+    '6B': 62500.0,   # British Pound: 62500 GBP × $1.00 = $62500 per point
+    '6A': 100000.0,  # Australian Dollar: 100000 AUD × $1.00 = $100000 per point
+    '6C': 100000.0,  # Canadian Dollar: 100000 CAD × $1.00 = $100000 per point
+    
+    # Micro Currency Futures
+    'M6E': 12500.0,  # Micro Euro: 12500 EUR × $1.00 = $12500 per point
+}
+
+
+def get_point_value(symbol, contract_details, multiplier):
+    """
+    Get the dollar value per 1.00 price move for a contract.
+    
+    Uses explicit metadata first, then falls back to deriving from contract details.
+    
+    Args:
+        symbol: The contract symbol (e.g., 'ES', 'MZN', 'ZC')
+        contract_details: Dict with priceMagnifier, mdSizeMultiplier, etc.
+        multiplier: The contract multiplier from IBKR
+    
+    Returns:
+        float: Dollar value per 1.00 price move
+    """
+    # First, check the explicit metadata dictionary
+    if symbol in CONTRACT_POINT_VALUES:
+        return CONTRACT_POINT_VALUES[symbol]
+    
+    # Fallback: try to derive from contract details
+    price_magnifier = contract_details.get('priceMagnifier', 1)
+    md_size_multiplier = contract_details.get('mdSizeMultiplier')
+    
+    # Case 1: Agricultural contracts (quoted in cents)
+    # priceMagnifier > 1 indicates price is in smaller units (e.g., cents)
+    if price_magnifier > 1 and md_size_multiplier is not None:
+        point_value = float(md_size_multiplier) / price_magnifier
+        logging.warning(f"Unknown contract {symbol}. Derived point value: ${point_value:.2f} "
+                       f"(mdSizeMultiplier={md_size_multiplier}, priceMagnifier={price_magnifier}). "
+                       f"Consider adding to CONTRACT_POINT_VALUES.")
+        return point_value
+    
+    # Case 2: Contracts where mdSizeMultiplier represents point value
+    elif md_size_multiplier is not None and md_size_multiplier > 1:
+        point_value = float(md_size_multiplier)
+        logging.warning(f"Unknown contract {symbol}. Using mdSizeMultiplier as point value: ${point_value:.2f}. "
+                       f"Consider adding to CONTRACT_POINT_VALUES.")
+        return point_value
+    
+    # Case 3: Standard contracts where multiplier is the point value
+    else:
+        point_value = multiplier if multiplier > 0 else 1.0
+        logging.warning(f"Unknown contract {symbol}. Using multiplier as point value: ${point_value:.2f}. "
+                       f"Consider adding to CONTRACT_POINT_VALUES.")
+        return point_value
+
 
 class DataWorker(QObject):
     """
@@ -107,15 +236,6 @@ class DataWorker(QObject):
 
         for i, p_data in enumerate(self.positions_data):
             symbol = p_data['symbol']
-            if self.atr_window.market_statuses.get(symbol) == 'CLOSED':
-                logging.info(f"Worker: Skipping stop loss for {symbol}: Market is closed.")
-                statuses_only.append({
-                    'symbol': symbol,
-                    'status': 'held',
-                    'message': 'Market Closed'
-                })
-                continue
-
             atr_value = None
             # Get the highest stop loss computed so far (the one ratcheting up)
             highest_stop = self.atr_window.highest_stop_losses.get(symbol, 0)
@@ -206,7 +326,7 @@ class ATRWindow(QMainWindow):
         self.user_submitted_atr = {}  # {symbol: timestamp_key}
         
         # Adaptive Stop Loss toggle state
-        self.send_adaptive_stops = True
+        self.send_adaptive_stops = False
         self.market_statuses = {}  # {symbol: 'OPEN' | 'CLOSED' | 'UNKNOWN'}
 
         # Central widget & layout
@@ -231,9 +351,9 @@ class ATRWindow(QMainWindow):
         toggle_layout.addWidget(toggle_label)
         
         self.adaptive_stop_toggle = QCheckBox()
-        self.adaptive_stop_toggle.setChecked(True)
+        self.adaptive_stop_toggle.setChecked(False)
         self.adaptive_stop_toggle.stateChanged.connect(self.on_adaptive_stop_toggled)
-        self.adaptive_stop_toggle.setText("ON")
+        self.adaptive_stop_toggle.setText("OFF")
         toggle_layout.addWidget(self.adaptive_stop_toggle)
         
         status_layout.addWidget(toggle_container)
@@ -285,15 +405,15 @@ class ATRWindow(QMainWindow):
         self.tabs.addTab(self.positions_tab, "Positions")
 
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
             "Position", "ATR", "ATR Ratio", "Positions Held",
-            "Current Price", "Computed Stop Loss", "$ Risk", "% Risk", "Status"
+            "Current Price", "Computed Stop Loss", "MinTick", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionsMovable(True)
         # Make the "Status" column (index 6) wider to accommodate text
-        self.table.setColumnWidth(8, 240)
+        self.table.setColumnWidth(9, 240)
         self.positions_layout.addWidget(self.table)
 
         # --- Raw Data Tab ---
@@ -329,6 +449,21 @@ class ATRWindow(QMainWindow):
         # Fetch data immediately on startup
         self.start_full_refresh()
     
+    def closeEvent(self, event):
+        """
+        Overrides the default close event to ensure background threads are
+        properly shut down before the application exits.
+        """
+        logging.info("Close event triggered. Attempting to stop worker thread...")
+        # Check if a worker thread exists and is running
+        if hasattr(self, 'thread') and self.thread and self.thread.isRunning():
+            self.thread.quit()  # Ask the thread's event loop to exit
+            if not self.thread.wait(5000):  # Wait up to 5 seconds for the thread to finish
+                logging.warning("Worker thread did not terminate gracefully. Forcing termination.")
+                self.thread.terminate() # As a last resort
+        
+        event.accept() # Proceed with closing the window
+
     def calculate_tr_and_atr(self, df, prior_atr, symbol=None):
         """
         Calculate True Range (TR) and Average True Range (ATR) for a given dataframe.
@@ -406,84 +541,109 @@ class ATRWindow(QMainWindow):
     def populate_positions_table(self):
         self.table.setRowCount(len(self.all_positions_details))
         for i, p_data in enumerate(self.all_positions_details):
-            pos = p_data['position']
-            symbol = p_data['symbol']
-            
-            # Column 0: Position
-            position_item = QTableWidgetItem(pos)
-            market_status = self.market_statuses.get(symbol, 'UNKNOWN')
+            try:
+                pos = p_data['position']
+                symbol = p_data['symbol']
+                
+                # Column 0: Position
+                position_item = QTableWidgetItem(pos)
+                market_status = self.market_statuses.get(symbol, 'UNKNOWN')
 
-            # Create a colored circle icon
-            pixmap = QtGui.QPixmap(16, 16)
-            if market_status == 'OPEN':
-                pixmap.fill(Qt.GlobalColor.green)
-            elif market_status == 'CLOSED':
-                pixmap.fill(Qt.GlobalColor.blue)
-            else:  # UNKNOWN or other
-                pixmap.fill(Qt.GlobalColor.gray)
-            
-            icon = QtGui.QIcon(pixmap)
-            position_item.setIcon(icon)
-            self.table.setItem(i, 0, position_item)
-            
-            # Column 1: ATR - Get ATR value from ATR calculations tab
-            atr_value = None
-            atr_display = "N/A"
-            if symbol in self.atr_symbols:
-                atr_index = self.atr_symbols.index(symbol)
-                if self.atr_calculated[atr_index] is not None:
-                    atr_value = self.atr_calculated[atr_index]
-                    atr_display = f"{atr_value:.2f}"
-            self.table.setItem(i, 1, QTableWidgetItem(atr_display))
+                # Create a colored circle icon
+                pixmap = QtGui.QPixmap(16, 16)
+                if market_status == 'OPEN':
+                    pixmap.fill(Qt.GlobalColor.green)
+                elif market_status == 'CLOSED':
+                    pixmap.fill(Qt.GlobalColor.blue)
+                else:  # UNKNOWN or other
+                    pixmap.fill(Qt.GlobalColor.gray)
+                
+                icon = QtGui.QIcon(pixmap)
+                position_item.setIcon(icon)
+                self.table.setItem(i, 0, position_item)
+                
+                # Column 1: ATR - Get ATR value from ATR calculations tab
+                atr_value = None
+                atr_display = "N/A"
+                if symbol in self.atr_symbols: # Use the full precision ATR value for calculation
+                    atr_index = self.atr_symbols.index(symbol)
+                    if self.atr_calculated[atr_index] is not None:
+                        atr_value = self.atr_calculated[atr_index]
+                        atr_display = f"{atr_value:.4f}" # Display with more precision
+                self.table.setItem(i, 1, QTableWidgetItem(atr_display))
 
-            # Column 2: ATR Ratio editable spin box
-            spin = QDoubleSpinBox()
-            spin.setMinimum(0.0)
-            spin.setMaximum(10.0)
-            spin.setSingleStep(0.1)
-            spin.setDecimals(1)
-            spin.setValue(self.atr_ratios[i])
-            spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-            spin.valueChanged.connect(lambda val, row=i: self.update_atr_ratio(row, val))
-            self.table.setCellWidget(i, 2, spin)
+                # Column 2: ATR Ratio editable spin box
+                spin = QDoubleSpinBox()
+                spin.setMinimum(0.1)
+                spin.setMaximum(10.0)
+                spin.setSingleStep(0.1)
+                spin.setDecimals(1)
+                spin.setValue(self.atr_ratios[i])
+                spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+                spin.valueChanged.connect(lambda val, row=i: self.update_atr_ratio(row, val))
+                self.table.setCellWidget(i, 2, spin)
 
-            # Column 3: Positions Held
-            self.table.setItem(i, 3, QTableWidgetItem(str(p_data['positions_held'])))
-            
-            # Column 4: Current Price
-            self.table.setItem(i, 4, QTableWidgetItem(f"{p_data['current_price']:.2f}"))
+                # Column 3: Positions Held
+                self.table.setItem(i, 3, QTableWidgetItem(str(p_data['positions_held'])))
+                
+                # Column 4: Current Price
+                self.table.setItem(i, 4, QTableWidgetItem(f"{p_data['current_price']:.2f}"))
 
-            # Column 5: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
-            # Stop loss never goes down - use highest computed value
-            computed_stop = self.compute_stop_loss(p_data, p_data['current_price'], atr_value, self.atr_ratios[i]) # self.atr_ratios is still correct by index
-            stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
-            self.table.setItem(i, 5, stop_item)
+                # Column 5: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
+                # Stop loss never goes down - use highest computed value
+                computed_stop = self.compute_stop_loss(p_data, p_data['current_price'], atr_value, self.atr_ratios[i])
+                self.computed_stop_losses[i] = computed_stop # Store the final computed stop
+                stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
+                self.table.setItem(i, 5, stop_item)
 
-            # Column 6: $ Risk
-            risk_value = 0
-            if computed_stop and p_data['current_price'] > 0:
-                risk_in_points = p_data['current_price'] - computed_stop
-                multiplier = p_data.get('multiplier', 1.0) # Get the contract multiplier
-                risk_value = risk_in_points * abs(p_data['positions_held']) * multiplier # Risk = (Price - Stop) * Quantity * Multiplier
-            risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
-            self.table.setItem(i, 6, risk_item)
+                # Column 6: MinTick
+                contract_details = p_data.get('contract_details', {})
+                min_tick = contract_details.get('minTick', 'N/A')
+                min_tick_item = QTableWidgetItem(str(min_tick))
+                self.table.setItem(i, 6, min_tick_item)
 
-            # Column 7: % Risk
-            hypothetical_account_value = 6000.0
-            percent_risk = 0.0
-            if hypothetical_account_value > 0:
-                percent_risk = (risk_value / hypothetical_account_value) * 100
-            percent_risk_item = QTableWidgetItem(f"{percent_risk:.2f}%")
-            
-            # Turn the text red if risk is over 2%
-            if percent_risk > 2.0:
-                percent_risk_item.setForeground(QtGui.QColor('red'))
+                # Column 7: $ Risk
+                risk_value = 0
+                if computed_stop and p_data['current_price'] > 0:
+                    risk_in_points = p_data['current_price'] - computed_stop
+                    # Ensure risk_in_points is always positive, as risk is an absolute value
+                    risk_in_points = abs(risk_in_points)
 
-            self.table.setItem(i, 7, percent_risk_item)
-    
-            # Column 8: Status
-            # Note: self.statuses[i] corresponds to the index of the symbol in self.symbols, not necessarily p_data
-            self.table.setItem(i, 8, QTableWidgetItem(self.statuses[i]))
+                    multiplier = p_data.get('multiplier', 1.0)
+
+                    # Use the centralized get_point_value function for accurate dollar risk calculation
+                    # This uses explicit per-contract metadata when available, with fallback logic
+                    point_value = get_point_value(symbol, contract_details, multiplier)
+
+                    # Total Risk = (Absolute Price Difference) * (Point Value) * (Quantity)
+                    risk_value = risk_in_points * point_value * abs(p_data['positions_held'])
+                risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
+                self.table.setItem(i, 7, risk_item)
+
+                # Column 8: % Risk
+                hypothetical_account_value = 6000.0
+                percent_risk = 0.0
+                if hypothetical_account_value > 0:
+                    percent_risk = (risk_value / hypothetical_account_value) * 100
+                percent_risk_item = QTableWidgetItem(f"{percent_risk:.2f}%")
+
+                # Turn the text red if risk is over 2%
+                if percent_risk > 2.0:
+                    percent_risk_item.setForeground(QtGui.QColor('red'))
+
+                self.table.setItem(i, 8, percent_risk_item)
+
+                # Column 9: Status
+                # Note: self.statuses[i] corresponds to the index of the symbol in self.symbols, not necessarily p_data
+                self.table.setItem(i, 9, QTableWidgetItem(self.statuses[i]))
+            except Exception as e:
+                symbol = p_data.get('symbol', 'UNKNOWN')
+                logging.error(f"Error populating table for symbol {symbol}: {e}")
+                # Optionally, display an error in the row
+                error_item = QTableWidgetItem(f"Error: {e}")
+                error_item.setForeground(QtGui.QColor('red'))
+                self.table.setItem(i, 0, QTableWidgetItem(symbol))
+                self.table.setItem(i, 9, error_item)
 
     def compute_stop_loss(self, position_data, current_price, atr_value, atr_ratio, apply_ratchet=True):
         """
@@ -498,25 +658,26 @@ class ATRWindow(QMainWindow):
         if atr_value is None or current_price <= 0:
             return self.highest_stop_losses.get(symbol, 0)
         
-        # Calculate new stop loss
-        new_stop = current_price - (atr_value * atr_ratio)
+        # Calculate new stop loss and round to 2 decimal places to avoid floating point issues
+        # before applying the min_tick logic.
+        new_stop = round(current_price - (atr_value * atr_ratio), 2)
 
         # --- Round to minTick ---
-        contract_details = self.contract_details_map.get(symbol, {})
-        min_tick = contract_details.get('minTick', 0.01)  # Default to 0.01
+        # This ensures the final stop price is a valid, tradable price for the contract.
+        contract_details = position_data.get('contract_details', {})
+        min_tick = contract_details.get('minTick') 
         quantity = position_data.get('positions_held', 0)
 
+        rounded_stop = new_stop
         if min_tick > 0:
             # For long positions (SELL stop), round down to be more conservative
             if quantity > 0:
                 rounded_stop = (new_stop // min_tick) * min_tick
-            # For short positions (BUY stop), round up to be more conservative
+            # For short positions (BUY stop), also round down as per user request.
             elif quantity < 0:
-                rounded_stop = ((new_stop + min_tick - 1e-9) // min_tick) * min_tick # Add epsilon for precision
-            else: # No position
-                rounded_stop = new_stop
-        else:
-            rounded_stop = new_stop
+                rounded_stop = (new_stop // min_tick) * min_tick
+            # If quantity is 0, we just use the raw calculation, though it won't be used for an order
+
 
         # Get previous highest stop loss for this symbol
         prev_highest = self.highest_stop_losses.get(symbol, 0)
@@ -795,7 +956,7 @@ class ATRWindow(QMainWindow):
             self.adaptive_stop_toggle.setText("ON")
             # Trigger a data fetch and order submission cycle immediately when enabled
             logging.info("Adaptive stops enabled. Triggering a full data refresh.")
-            self.start_data_fetch_thread()
+            self.start_full_refresh()
         else:
             self.adaptive_stop_toggle.setText("OFF")
         status_text = "ENABLED" if self.send_adaptive_stops else "DISABLED"
@@ -1082,6 +1243,7 @@ class ATRWindow(QMainWindow):
         self.positions_held.clear()
         self.current_prices.clear()
         self.multipliers.clear()
+        self.computed_stop_losses.clear()
 
         display_text = ""
         for p in positions_data:
@@ -1095,6 +1257,7 @@ class ATRWindow(QMainWindow):
 
             self.atr_ratios.append(old_atr_ratios_map.get(p['symbol'], 1.5))
             self.statuses.append("Updating...")
+            self.computed_stop_losses.append(0) # Initialize with 0
             raw_line = f"{p['symbol']} | Qty: {p['positions_held']} | Avg Cost: ${p['avg_cost']:.2f} | Price: ${p['current_price']:.2f} | P/L: ${p.get('unrealized_pl', 0):.2f} ({p.get('pl_percent', 0):.2f}%)"
             display_text += raw_line + "\n"
 

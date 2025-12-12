@@ -4,6 +4,8 @@ import random
 from datetime import datetime
 import logging
 import pytz
+import math
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 def fetch_positions():
     """
@@ -88,79 +90,94 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
         return results
     
     try:
-            print(f"\nSubmitting {len(stop_loss_data)} stop loss order(s)...")
-            # Get all open trades and create a map of symbol to existing stop order
-            open_trades = ib.openTrades()
-            existing_stop_orders = {}
-            for trade in open_trades:
-                # Ensure it's a Stop order
-                if trade.order.orderType == 'STP':
-                    # Use conId for a more reliable key than symbol
-                    conId = trade.contract.conId
-                    existing_stop_orders[conId] = trade
-                    existing_stop_orders[trade.contract.symbol] = trade
-            print(f"Found {len(existing_stop_orders)} existing stop orders.")
-            trades_to_monitor = []
+        print(f"\nSubmitting {len(stop_loss_data)} stop loss order(s)...")
+        # Get all open trades and create a map of conId to existing stop order
+        open_trades = ib.openTrades()
+        existing_stop_orders = {}
+        for trade in open_trades:
+            # Ensure it's a Stop order
+            if trade.order.orderType == 'STP':
+                # Use conId for a more reliable key than symbol
+                conId = trade.contract.conId
+                existing_stop_orders[conId] = trade
+        
+        print(f"Found {len(existing_stop_orders)} existing stop orders.")
+        trades_to_monitor = []
 
-            for symbol, data in stop_loss_data.items():
+        for symbol, data in stop_loss_data.items():
+            try:
+                stop_price = data.get('stop_price', 0)
+                quantity = data.get('quantity', 0)
+                contract_details = data.get('contract_details', {})
+                
+                if stop_price <= 0:
+                    # This case is now handled by the logic that builds stop_loss_data,
+                    # but we keep it as a safeguard.
+                    print(f"Skipping {symbol}: Invalid stop price {stop_price}")
+                    results.append({
+                        'symbol': symbol,
+                        'status': 'skipped',
+                        'message': f'Invalid stop price: {stop_price}'
+                    })
+                    continue
+                
+                if quantity == 0:
+                    print(f"Skipping {symbol}: No position quantity")
+                    results.append({
+                        'symbol': symbol,
+                        'status': 'skipped',
+                        'message': 'No position quantity'
+                    })
+                    continue
+                
+                if not contract_details:
+                    print(f"Skipping {symbol}: No position quantity")
+                    results.append({
+                        'symbol': symbol,
+                        'status': 'skipped',
+                        'message': 'No position quantity'
+                    })
+                    continue
+                
+                # Create contract from details
+                con_id = contract_details.get('conId', 0)
+                if not con_id:
+                    print(f"Skipping {symbol}: No conId available")
+                    results.append({
+                        'symbol': symbol,
+                        'status': 'skipped',
+                        'message': 'No contract ID available'
+                    })
+                    continue
+
                 try:
-                    stop_price = data.get('stop_price', 0)
-                    quantity = data.get('quantity', 0)
-                    contract_details = data.get('contract_details', {})
-                    
-                    if stop_price <= 0:
-                        print(f"Skipping {symbol}: Invalid stop price {stop_price}")
-                        results.append({
-                            'symbol': symbol,
-                            'status': 'skipped',
-                            'message': f'Invalid stop price: {stop_price}'
-                        })
-                        continue
-                    
-                    if quantity == 0:
-                        print(f"Skipping {symbol}: No position quantity")
-                        results.append({
-                            'symbol': symbol,
-                            'status': 'skipped',
-                            'message': 'No position quantity'
-                        })
-                        continue
-                    
-                    # Create contract from details
-                    con_id = contract_details.get('conId', 0)
-                    if con_id:
-                        contract = Contract(conId=con_id)
-                        ib.qualifyContracts(contract)
-                        print(f"Using conId {con_id} for {symbol}")
-                    else:
-                        print(f"Skipping {symbol}: No conId available")
-                        results.append({
-                            'symbol': symbol,
-                            'status': 'skipped',
-                            'message': 'No contract ID available'
-                        })
-                        continue
-                    
-                    # Determine order action based on position
-                    # For long positions (quantity > 0), we SELL to close
-                    # For short positions (quantity < 0), we BUY to close
-                    if quantity > 0:
-                        action = 'SELL'
-                        order_quantity = abs(quantity)
-                    else:
-                        action = 'BUY'
-                        order_quantity = abs(quantity)
+                    contract = Contract(conId=con_id)
+                    ib.qualifyContracts(contract)
+                except Exception as qe:
+                    print(f"Skipping {symbol}: Could not qualify contract with conId {con_id}. Error: {qe}")
+                    results.append({
+                        'symbol': symbol, 'status': 'error',
+                        'message': f'Contract qualification failed: {qe}'
+                    })
+                    continue
+                
+                # Determine order action based on position
+                # For long positions (quantity > 0), we SELL to close
+                # For short positions (quantity < 0), we BUY to close
+                action = 'SELL' if quantity > 0 else 'BUY'
+                order_quantity = abs(quantity)
 
-                    # Check if an order already exists for this contract's conId
-                    existing_trade = existing_stop_orders.get(con_id)
+                # The stop_price is now pre-rounded by the UI logic. No further calculation is needed here.
+                logging.info(f"Using pre-calculated stop price for {symbol}: {stop_price}")
 
-                    if not existing_trade:
-                        # This is a new order, handle it in a separate pass
-                        continue
+                # Check if an order already exists for this contract's conId
+                existing_trade = existing_stop_orders.get(con_id)
 
+                if existing_trade:
                     # --- This is an existing order, handle modification ---
                     existing_order = existing_trade.order
-                    if existing_order.stopPrice == round(stop_price, 2):
+                    # Compare rounded prices to avoid floating point issues
+                    if round(existing_order.stopPrice, 2) == round(stop_price, 2):
                         print(f"No change needed for {symbol}: Stop price is already {stop_price:.2f}")
                         results.append({'symbol': symbol, 'status': 'unchanged', 'message': 'Stop price is already correct.'})
                         continue
@@ -170,58 +187,31 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                         stop_order = StopOrder(
                             action=action,
                             totalQuantity=order_quantity,
-                            stopPrice=round(stop_price, 2),
+                            stopPrice=stop_price, # Use the pre-rounded price
                             orderId=existing_order.orderId, # IMPORTANT: Use existing orderId
                             tif='GTC'
                         )
                         trade = ib.placeOrder(contract, stop_order)
                         trades_to_monitor.append(trade)
-
-                except Exception as e:
-                    print(f"Error processing modification for {symbol}: {e}")
-                    results.append({'symbol': symbol, 'status': 'error', 'message': str(e)})
-            
-            # Give modifications a moment to process
-            if any(t for t in trades_to_monitor if t.order.orderId != 0):
-                print("Pausing for 1 second after modifications...")
-                ib.sleep(1)
-
-            # --- Second Pass: Create NEW orders ---
-            for symbol, data in stop_loss_data.items():
-                try:
-                    con_id = data.get('contract_details', {}).get('conId', 0)
-                    if con_id in existing_stop_orders:
-                        # Already handled in the modification pass
-                        continue
-
-                    # This is a new order
-                    stop_price = data.get('stop_price', 0)
-                    quantity = data.get('quantity', 0)
-                    contract = Contract(conId=con_id)
-                    ib.qualifyContracts(contract)
-                    
-                    action = 'SELL' if quantity > 0 else 'BUY'
-                    order_quantity = abs(quantity)
-
+                else:
+                    # --- This is a new order, create it ---
                     print(f"Creating new {action} STOP order for {symbol}: {order_quantity} @ {stop_price:.2f}")
                     stop_order = StopOrder(
                         action=action,
                         totalQuantity=order_quantity,
-                        stopPrice=round(stop_price, 2),
+                        stopPrice=stop_price, # Use the pre-rounded price
                         tif='GTC'
                     )
-
-                    # Place the new or modified order
                     trade = ib.placeOrder(contract, stop_order)
                     trades_to_monitor.append(trade)
-                    
-                except Exception as e:
-                    print(f"Error processing stop loss for {symbol}: {e}")
-                    results.append({
-                        'symbol': symbol,
-                        'status': 'error',
-                        'message': str(e)
-                    })
+
+            except Exception as e:
+                print(f"Error processing stop loss for {symbol}: {e}")
+                results.append({
+                    'symbol': symbol,
+                    'status': 'error',
+                    'message': str(e)
+                })
             
             # --- Wait for all submitted orders to be processed ---
             if trades_to_monitor:
@@ -284,6 +274,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
 def get_market_statuses_for_all(contracts_info):
     """
     Checks the market status for a batch of contracts in a single connection.
+    Each symbol is checked individually against its own trading hours and timezone.
 
     Args:
         contracts_info (dict): A dictionary mapping symbol to contract details dict.
@@ -301,6 +292,7 @@ def get_market_statuses_for_all(contracts_info):
         for symbol, details in contracts_info.items():
             con_id = details.get('conId')
             if not con_id:
+                logging.warning(f"No conId for {symbol}, skipping market status check")
                 continue
 
             try:
@@ -308,42 +300,59 @@ def get_market_statuses_for_all(contracts_info):
                 cds = ib.reqContractDetails(contract)
                 
                 if not cds:
+                    logging.warning(f"No contract details returned for {symbol} (conId: {con_id})")
                     continue
 
                 cd = cds[0]
-                trading_hours_str = cd.liquidHours or cd.tradingHours
-                time_zone_id = cd.timeZoneId
-
-                if not trading_hours_str or not time_zone_id:
+                
+                # Use the built-in liquidSessions() method which properly parses
+                # trading hours and handles timezones correctly for each contract
+                # liquidSessions returns sessions with timezone-aware datetimes
+                try:
+                    sessions = cd.liquidSessions()
+                except Exception as session_err:
+                    # Fallback to tradingSessions if liquidSessions fails
+                    logging.warning(f"liquidSessions failed for {symbol}, trying tradingSessions: {session_err}")
+                    try:
+                        sessions = cd.tradingSessions()
+                    except Exception as trading_err:
+                        logging.error(f"Both session methods failed for {symbol}: {trading_err}")
+                        continue
+                
+                if not sessions:
+                    # No sessions means market is closed or no trading hours defined
+                    logging.info(f"No trading sessions found for {symbol}, marking as CLOSED")
+                    statuses[symbol] = 'CLOSED'
                     continue
-
-                tz = pytz.timezone(time_zone_id)
-                now = datetime.now(tz)
+                
+                # Get the current time in UTC, which is what liquidSessions uses.
+                now_utc = datetime.now(pytz.utc)
+                time_zone_id = cd.timeZoneId
                 
                 is_open = False
-                sessions = trading_hours_str.split(';')
                 for session in sessions:
-                    if 'CLOSED' in session or not session:
-                        continue
+                    # session is a TradingSession namedtuple with start and end (timezone-aware datetimes)
+                    # These are already in UTC.
+                    session_start = session.start
+                    session_end = session.end
                     
-                    # Format is YYYYMMDD:HHMM
-                    parts = session.split('-')
-                    if len(parts) != 2: continue
-                    start_str, end_str = parts
-                    
-                    start_dt = datetime.strptime(start_str, '%Y%m%d:%H%M').astimezone(tz)
-                    end_dt = datetime.strptime(end_str, '%Y%m%d:%H%M').astimezone(tz)
-
-                    if start_dt <= now < end_dt:
+                    # Compare the current UTC time with the session's UTC start and end times.
+                    if session_start <= now_utc < session_end:
                         is_open = True
+                        logging.debug(
+                            f"{symbol}: Market OPEN. Current UTC time {now_utc.strftime('%H:%M:%S')} "
+                            f"is within session {session_start.strftime('%H:%M:%S')} - {session_end.strftime('%H:%M:%S')}"
+                        )
                         break
                 
                 statuses[symbol] = 'OPEN' if is_open else 'CLOSED'
+                logging.info(f"Market status for {symbol}: {statuses[symbol]} (timezone: {time_zone_id})")
+                
             except Exception as e:
                 logging.error(f"Error checking market status for {symbol}: {e}")
 
     except Exception as e:
-        logging.error(f"Error checking market status: {e}")
+        logging.error(f"Error connecting to IBKR for market status check: {e}")
     finally:
         if ib.isConnected():
             ib.disconnect()
@@ -377,8 +386,11 @@ def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]:
             except (ValueError, TypeError):
                 multiplier = 1.0
         
-        if sec_type == 'FUT' and multiplier > 1:
-            avg_cost = raw_avg_cost / multiplier
+        # For futures, avgCost is the total value (price * multiplier * quantity).
+        # We need to derive the price per contract.
+        # For stocks, avgCost is already the price per share.
+        if sec_type == 'FUT' and multiplier > 1 and positions_held != 0:
+            avg_cost = raw_avg_cost / (multiplier * positions_held)
         else:
             avg_cost = raw_avg_cost
 
@@ -458,21 +470,25 @@ def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) -> List[
 
         # Update contract details with minTick
         cd = contract_details_objects.get(symbol)
-        p_data['contract_details']['minTick'] = cd.minTick if cd else 0.01
+        if cd:
+            p_data['contract_details']['minTick'] = cd.minTick or 0.01 # Default to 0.01 if None
+            # Capture the price magnifier, which is crucial for contracts priced in cents.
+            p_data['contract_details']['priceMagnifier'] = int(cd.priceMagnifier) if cd.priceMagnifier else 1
+            # Capture the mdSizeMultiplier, which often represents the point value or contract size.
+            p_data['contract_details']['mdSizeMultiplier'] = int(cd.mdSizeMultiplier) if cd.mdSizeMultiplier is not None else None
 
         # Recalculate market values and P/L
         avg_cost = p_data['avg_cost']
         multiplier = p_data['multiplier']
         positions_held = p_data['positions_held']
 
-        cost_basis = avg_cost * multiplier * abs(positions_held)
-        market_value = current_price * multiplier * abs(positions_held)
-        
-        if positions_held > 0:
-            unrealized_pl = market_value - cost_basis
-        else:
-            unrealized_pl = cost_basis - market_value
-        
+        # For long positions, P/L is (current price - entry price) * multiplier * quantity.
+        # Both cost_basis and market_value should be positive.
+        cost_basis = avg_cost * multiplier * positions_held
+        market_value = current_price * multiplier * positions_held
+
+        unrealized_pl = market_value - cost_basis
+
         p_data['cost_basis'] = cost_basis
         p_data['market_value'] = market_value
         p_data['unrealized_pl'] = unrealized_pl
