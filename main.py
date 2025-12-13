@@ -19,6 +19,7 @@ from ib_insync import IB, Future, Stock, Contract
 import math
 import pandas as pd
 
+from decimal import Decimal, ROUND_DOWN
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -158,12 +159,13 @@ class DataWorker(QObject):
     Worker thread for fetching and processing all IBKR data.
     This runs in the background to keep the UI responsive.
     """
-    finished = pyqtSignal(str) # Pass stage name
+    finished = pyqtSignal()
     error = pyqtSignal(str)
     positions_ready = pyqtSignal(list)
-    market_data_ready = pyqtSignal(list)
+    market_data_ready = pyqtSignal(list) # This can be combined with positions_ready in the future
     atr_ready = pyqtSignal(dict)
     orders_submitted = pyqtSignal(list)
+    log_message = pyqtSignal(str) # Signal to send log messages to the UI
     
     def __init__(self, atr_window, atr_ratios, highest_stop_losses):
         super().__init__()
@@ -172,61 +174,65 @@ class DataWorker(QObject):
         self.send_adaptive_stops = atr_window.send_adaptive_stops
         self.atr_ratios = atr_ratios
         self.highest_stop_losses = highest_stop_losses
-        self.stage = "initial"
-        self.positions_data = []
 
     def run(self):
-        """Main worker method, executes a specific stage."""
+        """Main worker method, executes all data stages sequentially."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         ib = IB()
         try:
             client_id = random.randint(100, 999)
             ib.connect('127.0.0.1', 7497, clientId=client_id)
+            
+            # --- Stage 1: Fetch Positions ---
+            positions = ib.positions()
+            basic_positions = fetch_basic_positions(ib, positions)
+            self.positions_ready.emit(basic_positions)
+            
+            # --- Stage 2: Fetch Market Data ---
+            enriched_positions = fetch_market_data_for_positions(ib, basic_positions)
+            self.market_data_ready.emit(enriched_positions)
+            
+            # --- Stage 3: Calculate ATR ---
+            contract_details_map = {p['symbol']: p['contract_details'] for p in enriched_positions}
+            market_statuses = get_market_statuses_for_all(contract_details_map)
+            self.atr_window.market_statuses = market_statuses # Update main window
+            
+            symbols = [p['symbol'] for p in enriched_positions]
+            atr_results = self.atr_window.calculate_atr_for_symbols(symbols, market_statuses, contract_details_map)
+            self.atr_ready.emit(atr_results)
 
-            if self.stage == 'fetch_positions':
-                positions = ib.positions()
-                basic_positions = fetch_basic_positions(ib, positions)
-                self.positions_ready.emit(basic_positions)
+            # --- Stage 4: Submit Orders ---
+            if not self.send_adaptive_stops:
+                logging.info("Adaptive stops are disabled, skipping order submission.")
+                self.orders_submitted.emit([])
+                return
 
-            elif self.stage == 'fetch_market_data':
-                enriched_positions = fetch_market_data_for_positions(ib, self.positions_data)
-                self.market_data_ready.emit(enriched_positions)
+            # The main window now holds the definitive list of positions
+            self.atr_window.positions_data = enriched_positions
+            stop_loss_data = self.build_stop_loss_data()
+            final_results = stop_loss_data.get('statuses_only', [])
+            orders_to_submit = stop_loss_data.get('orders_to_submit', {})
 
-            elif self.stage == 'calculate_atr':
-                contract_details_map = {p['symbol']: p['contract_details'] for p in self.positions_data}
-                market_statuses = get_market_statuses_for_all(contract_details_map)
-                self.atr_window.market_statuses = market_statuses # Update main window
-                
-                symbols = [p['symbol'] for p in self.positions_data]
-                atr_results = self.atr_window.calculate_atr_for_symbols(symbols, market_statuses, contract_details_map)
-                self.atr_ready.emit(atr_results)
+            if orders_to_submit:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self.log_message.emit(f"--- [{timestamp}] Submitting Orders ---")
+                for symbol, data in orders_to_submit.items():
+                    self.log_message.emit(f"  {symbol}: Stop Price = {data['stop_price']:.4f}")
 
-            elif self.stage == 'submit_orders':
-                if not self.send_adaptive_stops:
-                    logging.info("Adaptive stops are disabled, skipping order submission.")
-                    self.orders_submitted.emit([])
-                    return
-
-                stop_loss_data = self.build_stop_loss_data()
-                # stop_loss_data now contains both orders to submit and statuses for skipped items
-                final_results = stop_loss_data.get('statuses_only', [])
-                orders_to_submit = stop_loss_data.get('orders_to_submit', {})
-
-                if orders_to_submit:
-                    submission_results = _submit_stop_loss_orders_internal(ib, orders_to_submit)
-                    final_results.extend(submission_results)
-                    self.orders_submitted.emit(final_results)
-                else:
-                    logging.info("No new stop loss orders to submit.")
-                    self.orders_submitted.emit(final_results)
+                submission_results = _submit_stop_loss_orders_internal(ib, orders_to_submit)
+                final_results.extend(submission_results)
+                self.orders_submitted.emit(final_results)
+            else:
+                logging.info("No new stop loss orders to submit.")
+                self.orders_submitted.emit(final_results)
 
         except Exception as e:
             self.error.emit(str(e))
         finally:
             if ib.isConnected():
                 ib.disconnect()
-            self.finished.emit(self.stage)
+            self.finished.emit()
             loop.close()
 
     def build_stop_loss_data(self):
@@ -234,32 +240,21 @@ class DataWorker(QObject):
         orders_to_submit = {}
         statuses_only = []
 
-        for i, p_data in enumerate(self.positions_data):
+        # Use the position data from the main window, which was set by the worker
+        for i, p_data in enumerate(self.atr_window.positions_data):
             symbol = p_data['symbol']
-            atr_value = None
-            # Get the highest stop loss computed so far (the one ratcheting up)
+            
+            # Use the already computed stop loss from the UI table's data model.
+            # This ensures that what the user sees is what gets submitted.
+            # The ratcheting logic is already applied when this value is calculated for the UI.
+            final_stop_price = self.atr_window.computed_stop_losses[i] if i < len(self.atr_window.computed_stop_losses) else 0
+
+            # Get the highest stop loss recorded to check if we should hold.
+            # This is a safety check. The primary logic is now driven by the UI-calculated value.
             highest_stop = self.atr_window.highest_stop_losses.get(symbol, 0)
-            # Get the current ATR ratio from the UI
-            atr_ratio = self.atr_ratios[i] if i < len(self.atr_ratios) else 1.5
 
 
-            if symbol in self.atr_window.atr_symbols:
-                try:
-                    atr_index = self.atr_window.atr_symbols.index(symbol)
-                    atr_value = self.atr_window.atr_calculated[atr_index]
-                except (ValueError, IndexError):
-                    pass
-
-            # This computes the *potential* new stop loss, without the ratcheting logic
-            potential_new_stop = self.atr_window.compute_stop_loss(
-                p_data,
-                p_data['current_price'],
-                atr_value,
-                atr_ratio,
-                apply_ratchet=False # We need the raw computed value to compare
-            )
-
-            if potential_new_stop <= 0:
+            if final_stop_price <= 0:
                 logging.info(f"Worker: Skipping {symbol}: No valid stop price computed.")
                 statuses_only.append({
                     'symbol': symbol,
@@ -269,8 +264,8 @@ class DataWorker(QObject):
                 continue
 
             # Ratchet check: if the new stop is lower than the highest one, hold the order
-            if highest_stop > 0 and potential_new_stop < highest_stop:
-                logging.info(f"Worker: Holding stop for {symbol}. New stop {potential_new_stop:.2f} is lower than existing {highest_stop:.2f}")
+            if highest_stop > 0 and final_stop_price < highest_stop:
+                logging.info(f"Worker: Holding stop for {symbol}. New stop {final_stop_price:.4f} is lower than existing {highest_stop:.4f}")
                 statuses_only.append({
                     'symbol': symbol,
                     'status': 'held',
@@ -279,7 +274,7 @@ class DataWorker(QObject):
                 continue
 
             orders_to_submit[symbol] = {
-                'stop_price': potential_new_stop, # Use the new valid stop price
+                'stop_price': final_stop_price, # Use the final, rounded, ratcheted stop price
                 'quantity': p_data['positions_held'],
                 'contract_details': p_data['contract_details']
             }
@@ -304,6 +299,8 @@ class ATRWindow(QMainWindow):
         self.computed_stop_losses = []  # Current computed stop losses
         self.all_positions_details = [] # Store full position dictionaries
         self.highest_stop_losses = {}  # Track highest stop loss per symbol (never goes down)
+        self.thread = None # Initialize thread attribute to None
+        self.positions_data = [] # Store latest enriched position data for order submission
         self.contract_details_map = {}  # Store contract details by symbol
         
         # ATR calculation data
@@ -398,6 +395,17 @@ class ATRWindow(QMainWindow):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
 
+        # --- Terminal/Log View ---
+        log_label = QLabel("Log Output:")
+        log_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(log_label)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        # A simple dark theme for the log view
+        self.log_view.setStyleSheet("background-color: #2B2B2B; color: #A9B7C6; font-family: 'Courier New';")
+        self.log_view.setMaximumHeight(200) # Give it a fixed max height
+        layout.addWidget(self.log_view)
+
         # --- Positions Table Tab ---
         self.positions_tab = QWidget()
         self.positions_layout = QVBoxLayout()
@@ -448,6 +456,12 @@ class ATRWindow(QMainWindow):
         
         # Fetch data immediately on startup
         self.start_full_refresh()
+
+    def log_to_ui(self, message):
+        """Appends a message to the log view and auto-scrolls to the bottom."""
+        self.log_view.append(message)
+        # Ensure the view scrolls to the latest message
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())    
     
     def closeEvent(self, event):
         """
@@ -658,39 +672,38 @@ class ATRWindow(QMainWindow):
         if atr_value is None or current_price <= 0:
             return self.highest_stop_losses.get(symbol, 0)
         
-        # Calculate new stop loss and round to 2 decimal places to avoid floating point issues
-        # before applying the min_tick logic.
-        new_stop = round(current_price - (atr_value * atr_ratio), 2)
-
-        # --- Round to minTick ---
-        # This ensures the final stop price is a valid, tradable price for the contract.
+        # --- Calculate Stop Price and Round to minTick using Decimal for precision ---
+        raw_stop = current_price - (atr_value * atr_ratio)
+        
         contract_details = position_data.get('contract_details', {})
         min_tick = contract_details.get('minTick') 
         quantity = position_data.get('positions_held', 0)
 
-        rounded_stop = new_stop
-        if min_tick > 0:
-            # For long positions (SELL stop), round down to be more conservative
-            if quantity > 0:
-                rounded_stop = (new_stop // min_tick) * min_tick
-            # For short positions (BUY stop), also round down as per user request.
-            elif quantity < 0:
-                rounded_stop = (new_stop // min_tick) * min_tick
-            # If quantity is 0, we just use the raw calculation, though it won't be used for an order
-
+        final_stop = float(raw_stop) # Default to float if no rounding is needed
+        if min_tick > 0 and quantity != 0:
+            # Use Decimal for accurate rounding to the specified tick size.
+            # We round down to be more conservative (lower stop for longs, higher stop for shorts is handled by the subtraction).
+            # A lower SELL stop or a lower BUY stop (for shorts) is always safer.
+            raw_stop_decimal = Decimal(str(raw_stop))
+            min_tick_decimal = Decimal(str(min_tick))
+            
+            # Perform rounding: (value / tick_size).quantize(ROUND_DOWN) * tick_size
+            rounded_stop_decimal = (raw_stop_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * min_tick_decimal
+            final_stop = float(rounded_stop_decimal)
+            logging.debug(f"Rounding for {symbol}: raw={raw_stop}, minTick={min_tick}, final={final_stop}")
 
         # Get previous highest stop loss for this symbol
         prev_highest = self.highest_stop_losses.get(symbol, 0)
         
         if apply_ratchet:
             # Stop loss never goes down - use max of new and previous
-            if rounded_stop > prev_highest:
-                self.highest_stop_losses[symbol] = rounded_stop
-                return rounded_stop
+            if final_stop > prev_highest:
+                self.highest_stop_losses[symbol] = final_stop
+                return final_stop
             else:
                 return prev_highest
         else:
-            return rounded_stop # Return the raw computed value if not ratcheting
+            return final_stop # Return the raw computed value if not ratcheting
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
@@ -1149,56 +1162,52 @@ class ATRWindow(QMainWindow):
         self.update_status(False) # Show as disconnected/refreshing
         self.connection_status.setText("Refreshing...")
         self.connection_status.setStyleSheet("color: orange; font-weight: bold;")
-        self.start_worker_stage('fetch_positions')
+        self.start_worker()
 
-    def start_worker_stage(self, stage, positions_data=None):
-        """Creates and starts a worker for a specific stage."""
+    def start_worker(self):
+        """Creates and starts a single worker for the entire refresh cycle."""
+        # If a thread is already running, don't start a new one.
+        if hasattr(self, 'thread') and self.thread and self.thread.isRunning():
+            logging.warning("Refresh already in progress. Skipping new request.")
+            return
+
         self.thread = QThread()
         self.worker = DataWorker(self, self.atr_ratios, self.highest_stop_losses)
-        self.worker.stage = stage
-        if positions_data:
-            self.worker.positions_data = positions_data
-
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_worker_finished)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
         self.worker.error.connect(self.handle_data_error)
+        self.worker.log_message.connect(self.log_to_ui)
 
-        # Connect stage-specific signals
-        if stage == 'fetch_positions':
-            self.worker.positions_ready.connect(self.handle_positions_ready)
-        elif stage == 'fetch_market_data':
-            self.worker.market_data_ready.connect(self.handle_market_data_ready)
-        elif stage == 'calculate_atr':
-            self.worker.atr_ready.connect(self.handle_atr_ready)
-        elif stage == 'submit_orders':
-            self.worker.orders_submitted.connect(self.handle_orders_submitted)
+        # Connect all signals at once
+        self.worker.positions_ready.connect(self.handle_positions_ready)
+        self.worker.market_data_ready.connect(self.handle_market_data_ready)
+        self.worker.atr_ready.connect(self.handle_atr_ready)
+        self.worker.orders_submitted.connect(self.handle_orders_submitted)
 
         self.thread.start()
-        logging.info(f"Worker started for stage: {stage}")
+        logging.info("Worker started for full refresh cycle.")
 
-    def on_worker_finished(self, stage):
-        """Called when any worker stage finishes. Triggers the next stage."""
-        # Ensure the thread is properly quit before we proceed.
+    def on_worker_finished(self):
+        """Called when the worker's run() method completes."""
+        logging.info("Worker has finished all stages.")
+        self.update_status(True)
+        self.update_timestamp()
+
+        # Cleanly shut down the thread and worker
         if self.thread and self.thread.isRunning():
             self.thread.quit()
-            self.thread.wait() # Wait for the thread to fully terminate
-
-        logging.info(f"Worker finished stage: {stage}")
-
-        if stage == 'fetch_positions':
-            self.start_worker_stage('fetch_market_data', self.all_positions_details)
-        elif stage == 'fetch_market_data':
-            self.start_worker_stage('calculate_atr', self.all_positions_details)
-        elif stage == 'calculate_atr':
-            self.start_worker_stage('submit_orders', self.all_positions_details)
-        elif stage == 'submit_orders':
-            self.update_status(True)
-            self.update_timestamp()
-            logging.info("All data loading stages complete.")
+            self.thread.wait()
+        
+        if hasattr(self, 'worker') and self.worker:
+            # Schedule for deletion and clear the Python reference
+            self.worker.deleteLater()
+            self.worker = None
+        if hasattr(self, 'thread') and self.thread:
+            # Schedule for deletion and clear the Python reference
+            self.thread.deleteLater()
+            self.thread = None
 
     def handle_positions_ready(self, positions_data):
         """Stage 1: Basic positions are ready. Populate table with what we have."""
@@ -1214,6 +1223,7 @@ class ATRWindow(QMainWindow):
     def handle_market_data_ready(self, positions_data):
         """Stage 2: Market data is ready. Repopulate table with prices."""
         logging.info("Stage 2 Complete: Received market data.")
+        self.positions_data = positions_data # Store the latest data
         self.update_ui_with_position_data(positions_data)
 
     def handle_atr_ready(self, atr_results):

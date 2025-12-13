@@ -187,7 +187,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                         stop_order = StopOrder(
                             action=action,
                             totalQuantity=order_quantity,
-                            stopPrice=stop_price, # Use the pre-rounded price
+                            stopPrice=round(stop_price, 2), # Explicitly round to 2 decimal places
                             orderId=existing_order.orderId, # IMPORTANT: Use existing orderId
                             tif='GTC'
                         )
@@ -199,7 +199,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                     stop_order = StopOrder(
                         action=action,
                         totalQuantity=order_quantity,
-                        stopPrice=stop_price, # Use the pre-rounded price
+                        stopPrice=round(stop_price, 2), # Explicitly round to 2 decimal places
                         tif='GTC'
                     )
                     trade = ib.placeOrder(contract, stop_order)
