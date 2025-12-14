@@ -1,5 +1,6 @@
 from ib_insync import IB, util, Contract, StopOrder
 from time import sleep
+import asyncio
 import random
 from datetime import datetime
 import logging
@@ -66,8 +67,7 @@ from ib_insync.objects import Position
 from typing import List, Dict
 import math
 
-
-def _submit_stop_loss_orders_internal(ib, stop_loss_data):
+async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
     """
     Submit stop loss orders for each symbol in stop_loss_data.
     Cancels any existing orders for each symbol before submitting new stop loss.
@@ -92,7 +92,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
     try:
         print(f"\nSubmitting {len(stop_loss_data)} stop loss order(s)...")
         # Get all open trades and create a map of conId to existing stop order
-        open_trades = ib.openTrades()
+        open_trades = await ib.reqAllOpenOrdersAsync()
         existing_stop_orders = {}
         for trade in open_trades:
             # Ensure it's a Stop order
@@ -152,7 +152,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
 
                 try:
                     contract = Contract(conId=con_id)
-                    ib.qualifyContracts(contract)
+                    await ib.qualifyContractsAsync(contract)
                 except Exception as qe:
                     print(f"Skipping {symbol}: Could not qualify contract with conId {con_id}. Error: {qe}")
                     results.append({
@@ -191,7 +191,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                             orderId=existing_order.orderId, # IMPORTANT: Use existing orderId
                             tif='GTC'
                         )
-                        trade = ib.placeOrder(contract, stop_order)
+                        trade = await ib.placeOrderAsync(contract, stop_order)
                         trades_to_monitor.append(trade)
                 else:
                     # --- This is a new order, create it ---
@@ -202,7 +202,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                         stopPrice=round(stop_price, 2), # Explicitly round to 2 decimal places
                         tif='GTC'
                     )
-                    trade = ib.placeOrder(contract, stop_order)
+                    trade = await ib.placeOrderAsync(contract, stop_order)
                     trades_to_monitor.append(trade)
 
             except Exception as e:
@@ -219,7 +219,7 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                 max_wait = 15  # seconds
                 waited = 0
                 while waited < max_wait:
-                    ib.sleep(1) # Process events
+                    await asyncio.sleep(1) # Process events asynchronously
                     waited += 1
                     if all(t.isDone() for t in trades_to_monitor):
                         print("All orders have reached a final state.")
@@ -271,25 +271,20 @@ def _submit_stop_loss_orders_internal(ib, stop_loss_data):
         logging.error(f"An error occurred during stop loss submission: {e}")
     return results
 
-def get_market_statuses_for_all(contracts_info):
+async def get_market_statuses_for_all(ib: IB, contracts_info: dict) -> dict:
     """
     Checks the market status for a batch of contracts in a single connection.
     Each symbol is checked individually against its own trading hours and timezone.
 
     Args:
+        ib (IB): The connected ib_insync IB instance.
         contracts_info (dict): A dictionary mapping symbol to contract details dict.
 
     Returns:
         dict: A dictionary mapping symbol to its market status ('OPEN', 'CLOSED', 'UNKNOWN').
     """
-    ib = IB()
     statuses = {symbol: 'UNKNOWN' for symbol in contracts_info}
-    
-    try:
-        client_id = random.randint(100, 999)
-        ib.connect('127.0.0.1', 7497, clientId=client_id, timeout=5)
-
-        for symbol, details in contracts_info.items():
+    for symbol, details in contracts_info.items():
             con_id = details.get('conId')
             if not con_id:
                 logging.warning(f"No conId for {symbol}, skipping market status check")
@@ -297,7 +292,7 @@ def get_market_statuses_for_all(contracts_info):
 
             try:
                 contract = Contract(conId=con_id)
-                cds = ib.reqContractDetails(contract)
+                cds = await ib.reqContractDetailsAsync(contract)
                 
                 if not cds:
                     logging.warning(f"No contract details returned for {symbol} (conId: {con_id})")
@@ -350,27 +345,20 @@ def get_market_statuses_for_all(contracts_info):
                 
             except Exception as e:
                 logging.error(f"Error checking market status for {symbol}: {e}")
-
-    except Exception as e:
-        logging.error(f"Error connecting to IBKR for market status check: {e}")
-    finally:
-        if ib.isConnected():
-            ib.disconnect()
-            
     return statuses
 
-def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]:
+async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]:
     """
     Stage 1: Fetches basic position data without market data.
     Qualifies contracts and calculates entry price.
+    This is an async function.
     """
     results = []
     if not positions:
         return results
 
-    # Qualify contracts first to fill in missing details like exchange
-    contracts = [pos.contract for pos in positions]
-    ib.qualifyContracts(*contracts)
+    contracts_to_qualify = [pos.contract for pos in positions]
+    await ib.qualifyContractsAsync(*contracts_to_qualify)
 
     for pos in positions:
         positions_held = float(pos.position)
@@ -418,7 +406,7 @@ def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]:
         })
     return results
 
-def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) -> List[Dict]:
+async def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) -> List[Dict]:
     """
     Stage 2: Enriches position data with live market prices and contract details.
     """
@@ -427,13 +415,13 @@ def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) -> List[
 
     # Create contracts from conIds for reliability
     contracts = [Contract(conId=p['contract_details']['conId']) for p in positions_data]
-    ib.qualifyContracts(*contracts)
+    await ib.qualifyContractsAsync(*contracts)
 
     # Get full contract details to retrieve minTick
     contract_details_objects = {}
     for contract in contracts:
         try:
-            cds = ib.reqContractDetails(contract)
+            cds = await ib.reqContractDetailsAsync(contract)
             if cds:
                 contract_details_objects[contract.symbol] = cds[0]
         except Exception as e:
@@ -448,7 +436,7 @@ def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) -> List[
         tickers[p['symbol']] = ib.reqMktData(contract, "", False, False)
     
     logging.info("Waiting for market data to populate...")
-    ib.sleep(5)
+    await asyncio.sleep(5)
     logging.info("Finished waiting for market data.")
 
     for p_data in positions_data:

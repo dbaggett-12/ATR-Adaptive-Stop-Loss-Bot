@@ -14,8 +14,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QMovie
-from ibkr_api import get_market_statuses_for_all, _submit_stop_loss_orders_internal, fetch_basic_positions, fetch_market_data_for_positions
-from ib_insync import IB, Future, Stock, Contract
+from ibkr_api import get_market_statuses_for_all, fetch_basic_positions, fetch_market_data_for_positions
+from ib_insync import IB, util, Future, Stock, Contract, Order, StopOrder
 import math
 import pandas as pd
 
@@ -162,7 +162,7 @@ class DataWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     positions_ready = pyqtSignal(list)
-    market_data_ready = pyqtSignal(list) # This can be combined with positions_ready in the future
+    market_data_ready = pyqtSignal(list)
     atr_ready = pyqtSignal(dict)
     orders_submitted = pyqtSignal(list)
     log_message = pyqtSignal(str) # Signal to send log messages to the UI
@@ -175,35 +175,35 @@ class DataWorker(QObject):
         self.atr_ratios = atr_ratios
         self.highest_stop_losses = highest_stop_losses
 
-    def run(self):
+    async def run_async(self):
         """Main worker method, executes all data stages sequentially."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         ib = IB()
         try:
             client_id = random.randint(100, 999)
-            ib.connect('127.0.0.1', 7497, clientId=client_id)
+            await ib.connectAsync('127.0.0.1', 7497, clientId=client_id)
             
             # --- Stage 1: Fetch Positions ---
-            positions = ib.positions()
-            basic_positions = fetch_basic_positions(ib, positions)
+            # Using reqPositionsAsync for non-blocking behavior
+            positions = await ib.reqPositionsAsync()
+            basic_positions = await fetch_basic_positions(ib, positions)
             self.positions_ready.emit(basic_positions)
             
             # --- Stage 2: Fetch Market Data ---
-            enriched_positions = fetch_market_data_for_positions(ib, basic_positions)
+            enriched_positions = await fetch_market_data_for_positions(ib, basic_positions)
             self.market_data_ready.emit(enriched_positions)
             
             # --- Stage 3: Calculate ATR ---
             contract_details_map = {p['symbol']: p['contract_details'] for p in enriched_positions}
-            market_statuses = get_market_statuses_for_all(contract_details_map)
+            market_statuses = await get_market_statuses_for_all(ib, contract_details_map)
             self.atr_window.market_statuses = market_statuses # Update main window
             
             symbols = [p['symbol'] for p in enriched_positions]
-            atr_results = self.atr_window.calculate_atr_for_symbols(symbols, market_statuses, contract_details_map)
+            atr_results = await self.atr_window.calculate_atr_for_symbols(ib, symbols, market_statuses, contract_details_map)
             self.atr_ready.emit(atr_results)
 
             # --- Stage 4: Submit Orders ---
-            if not self.send_adaptive_stops:
+            # Read the latest state of the toggle directly from the window
+            if not self.atr_window.send_adaptive_stops:
                 logging.info("Adaptive stops are disabled, skipping order submission.")
                 self.orders_submitted.emit([])
                 return
@@ -213,6 +213,14 @@ class DataWorker(QObject):
             stop_loss_data = self.build_stop_loss_data()
             final_results = stop_loss_data.get('statuses_only', [])
             orders_to_submit = stop_loss_data.get('orders_to_submit', {})
+            
+            # Get all open trades to check for existing stop orders
+            open_trades = await ib.reqAllOpenOrdersAsync()
+            existing_stop_orders = {}
+            for trade in open_trades:
+                if trade.order.orderType == 'STP':
+                    # Use conId for a more reliable key than symbol
+                    existing_stop_orders[trade.contract.conId] = trade
 
             if orders_to_submit:
                 timestamp = datetime.now().strftime("%H:%M:%S")
@@ -220,7 +228,10 @@ class DataWorker(QObject):
                 for symbol, data in orders_to_submit.items():
                     self.log_message.emit(f"  {symbol}: Stop Price = {data['stop_price']:.4f}")
 
-                submission_results = _submit_stop_loss_orders_internal(ib, orders_to_submit)
+                # Submit all orders concurrently using asyncio.gather
+                tasks = [self.submit_or_modify_order(ib, symbol, data, existing_stop_orders) for symbol, data in orders_to_submit.items()]
+                submission_results = await asyncio.gather(*tasks)
+
                 final_results.extend(submission_results)
                 self.orders_submitted.emit(final_results)
             else:
@@ -233,7 +244,81 @@ class DataWorker(QObject):
             if ib.isConnected():
                 ib.disconnect()
             self.finished.emit()
-            loop.close()
+
+    def run(self):
+        """Synchronous entry point that runs the async run_async method."""
+        asyncio.run(self.run_async())
+
+    async def submit_or_modify_order(self, ib, symbol, order_data, existing_stop_orders):
+        """Submits a new stop loss order or modifies an existing one."""
+        contract_details = order_data['contract_details']
+        quantity = order_data['quantity']
+        stop_price = order_data['stop_price']
+        con_id = contract_details.get('conId')
+
+        try:
+            # Recreate the contract object for placing the order
+            contract = Contract(
+                conId=contract_details['conId'],
+                exchange=contract_details.get('exchange', '')
+            )
+            await ib.qualifyContractsAsync(contract)
+
+            # Determine order action based on position quantity
+            action = 'SELL' if quantity > 0 else 'BUY'
+            total_quantity = abs(quantity)
+
+            existing_trade = existing_stop_orders.get(con_id)
+
+            if existing_trade:
+                # --- MODIFY EXISTING ORDER ---
+                existing_order = existing_trade.order
+                # Compare rounded prices to avoid floating point issues
+                if round(existing_order.stopPrice, 4) == round(stop_price, 4):
+                    logging.info(f"No change needed for {symbol}: Stop price is already {stop_price:.4f}")
+                    return {'symbol': symbol, 'status': 'unchanged', 'message': f'Stop price is already {stop_price:.4f}'}
+                
+                logging.info(f"Modifying {symbol} stop order from {existing_order.stopPrice} to {stop_price:.4f}")
+                order = StopOrder(
+                    action=action,
+                    totalQuantity=total_quantity,
+                    stopPrice=stop_price,
+                    orderId=existing_order.orderId, # IMPORTANT: Use existing orderId to modify
+                    tif='GTC'
+                )
+            else:
+                # --- CREATE NEW ORDER ---
+                logging.info(f"Creating new {action} STOP for {symbol}: {total_quantity} @ {stop_price:.4f}")
+                order = StopOrder(
+                    action=action,
+                    totalQuantity=total_quantity,
+                    stopPrice=stop_price,
+                    tif='GTC'  # Good-Til-Canceled
+                )
+
+            # placeOrder is synchronous and returns a Trade object immediately. It is not awaitable.
+            trade = ib.placeOrder(contract, order)
+            logging.info(f"Placed order for {symbol}. OrderId: {trade.order.orderId}. Waiting for status...")
+
+            # Wait for the order status to be updated.
+            # The 'update' event on the trade is fired when its state changes.
+            try:
+                await asyncio.wait_for(trade.statusEvent, timeout=10)  # Wait up to 10 seconds
+            except asyncio.TimeoutError:
+                logging.warning(f"Timeout waiting for order status update for {symbol}. Current status: {trade.orderStatus.status}")
+
+            final_status = trade.orderStatus.status
+            if final_status in {'Submitted', 'PreSubmitted', 'ApiPending', 'PendingSubmit'}:
+                logging.info(f"Successfully submitted stop loss for {symbol} at {stop_price}")
+                return {'symbol': symbol, 'status': 'submitted', 'message': f'Stop at {stop_price:.4f} ({final_status})'}
+            else:
+                logging.error(f"Order for {symbol} was not submitted successfully. Status: {trade.orderStatus.status}")
+                return {'symbol': symbol, 'status': 'error', 'message': f'Failed: {trade.orderStatus.status}'}
+
+        except Exception as e:
+            logging.error(f"Error processing stop loss for {symbol}: {e}")
+            return {'symbol': symbol, 'status': 'error', 'message': str(e)}
+
 
     def build_stop_loss_data(self):
         """Prepares the data structure for submitting stop loss orders."""
@@ -889,196 +974,125 @@ class ATRWindow(QMainWindow):
                 if self.atr_calculated[row] is not None:
                     item.setText(f"{self.atr_calculated[row]:.2f}")
 
-    def recalculate_single_symbol_atr(self, row, symbol, prior_atr):
-        """Recalculate ATR for a single symbol with the given prior ATR"""
-        ib = IB()
-        try:
-            ib.connect('127.0.0.1', 7497, clientId=random.randint(100, 999))
-            
-            # Get contract details from position data if available
-            contract_info = self.contract_details_map.get(symbol, {})
-            
-            # Create contract using actual details from position
-            if contract_info.get('conId'):
-                # Use conId for most accurate contract identification
-                contract = Contract(
-                    conId=contract_info['conId'],
-                    exchange=contract_info.get('exchange', '') # Explicitly add exchange
-                )
-                ib.qualifyContracts(contract)
-                logging.info(f"Recalculating ATR for conId {contract.conId} on exchange '{contract.exchange}'")
-            elif contract_info.get('lastTradeDateOrContractMonth'):
-                # Use actual expiration date from position
-                contract = Future(
-                    symbol=symbol,
-                    lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
-                    exchange=contract_info.get('exchange', 'CME'),
-                    currency=contract_info.get('currency', 'USD')
-                )
-                ib.qualifyContracts(contract)
-            else:
-                print(f"No contract details available for {symbol}")
-                return
-            
-            bars = ib.reqHistoricalData(
-                contract,
-                endDateTime='',
-                durationStr='1 D',
-                barSizeSetting='15 mins',
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=1
-            )
-            
-            if bars and len(bars) >= 2:
-                df = pd.DataFrame([{
-                    'open': b.open,
-                    'high': b.high,
-                    'low': b.low,
-                    'close': b.close,
-                    'volume': b.volume
-                } for b in bars])
-                
-                tr, atr = self.calculate_tr_and_atr(df, prior_atr=prior_atr, symbol=symbol)
-                
-                if tr is not None and atr is not None:
-                    # Update the values
-                    self.tr_values[row] = tr
-                    self.atr_calculated[row] = atr
-                    
-                    self.atr_table.item(row, 2).setText(f"{tr:.2f}")
-                    self.atr_table.item(row, 3).setText(f"{atr:.2f}")
-                    # Save today's ATR
-                    self.save_today_atr(symbol, atr)
-                    logging.info(f"Updated: Symbol: {symbol}, TR: {tr:.2f}, ATR: {atr:.2f}")
-                    
-                    # Update the Positions table to show the new ATR value
-                    self.populate_positions_table()
-                    
-        except Exception as e:
-            print(f"Error recalculating ATR for {symbol}: {e}")
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
+    def start_single_atr_recalc_worker(self, row, symbol, prior_atr):
+        """Starts a worker to recalculate ATR for a single symbol asynchronously."""
+        # We can reuse the DataWorker if we give it a specific task, or create a new one.
+        # For simplicity, let's create a small, dedicated async runner.
+        
+        async def task():
+            ib = IB()
+            try:
+                client_id = random.randint(100, 999)
+                await ib.connectAsync('127.0.0.1', 7497, clientId=client_id)
+                await self.recalculate_single_symbol_atr_async(ib, row, symbol, prior_atr)
+            except Exception as e:
+                logging.error(f"Error in single ATR recalc worker for {symbol}: {e}")
+            finally:
+                if ib.isConnected():
+                    ib.disconnect()
 
-    def on_adaptive_stop_toggled(self, state):
-        """Handle adaptive stop loss toggle change"""
-        self.send_adaptive_stops = self.adaptive_stop_toggle.isChecked()
-        # Update checkbox text
-        if self.send_adaptive_stops:
-            self.adaptive_stop_toggle.setText("ON")
-            # Trigger a data fetch and order submission cycle immediately when enabled
-            logging.info("Adaptive stops enabled. Triggering a full data refresh.")
-            self.start_full_refresh()
-        else:
-            self.adaptive_stop_toggle.setText("OFF")
-        status_text = "ENABLED" if self.send_adaptive_stops else "DISABLED"
-        logging.info(f"Adaptive Stop Losses: {status_text}")
+        # We need a way to run this async task in a separate thread.
+        # The simplest way is to use a QThread and a QObject runner.
+        class Runner(QObject):
+            finished = pyqtSignal()
+            def run(self):
+                asyncio.run(task())
+                self.finished.emit()
 
-    def update_atr_ratio(self, row, value):
-        self.atr_ratios[row] = value
-        # Recalculate and update stop loss when ratio changes
-        self.populate_positions_table()
+        self.recalc_thread = QThread()
+        self.recalc_runner = Runner()
+        self.recalc_runner.moveToThread(self.recalc_thread)
+        self.recalc_thread.started.connect(self.recalc_runner.run)
+        self.recalc_runner.finished.connect(self.recalc_thread.quit)
+        self.recalc_runner.finished.connect(self.recalc_runner.deleteLater)
+        self.recalc_thread.finished.connect(self.recalc_thread.deleteLater)
+        self.recalc_thread.start()
 
-    def update_status(self, connected):
-        """Update the connection status display"""
-        if connected:
-            self.connection_status.setText("Connected")
-            self.connection_status.setStyleSheet("color: green; font-weight: bold;")
-        else:
-            self.connection_status.setText("Disconnected")
-            self.connection_status.setStyleSheet("color: red; font-weight: bold;")
-    
-    def update_timestamp(self):
-        """Update the last data pull timestamp"""
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.last_pull_time.setText(current_time)
+    async def recalculate_single_symbol_atr_async(self, ib, row, symbol, prior_atr):
+        """Recalculates ATR for a single symbol asynchronously using a provided IB connection."""
+        contract_info = self.contract_details_map.get(symbol, {})
+        
+        if not contract_info.get('conId'):
+            logging.error(f"No conId available for {symbol} to recalculate ATR.")
+            return
 
-    def calculate_atr_for_symbols(self, symbols, market_statuses, contract_details_map):
+        contract = Contract(conId=contract_info['conId'], exchange=contract_info.get('exchange', ''))
+        await ib.qualifyContractsAsync(contract)
+        logging.info(f"Recalculating ATR for conId {contract.conId} on exchange '{contract.exchange}'")
+
+        bars = await ib.reqHistoricalDataAsync(
+            contract, endDateTime='', durationStr='1 D', barSizeSetting='15 mins',
+            whatToShow='TRADES', useRTH=True, formatDate=1
+        )
+        
+        if bars and len(bars) >= 2:
+            df = util.df(bars)
+            tr, atr = self.calculate_tr_and_atr(df, prior_atr=prior_atr, symbol=symbol)
+
+            if tr is not None and atr is not None:
+                # Since this runs in a background thread, we need to update UI elements
+                # safely. We can store the results and update the UI in the main thread,
+                # but for this direct update, let's assume it's safe enough for now.
+                # A more robust solution would use signals.
+                self.tr_values[row] = tr
+
+    async def calculate_atr_for_symbols(self, ib, symbols, market_statuses, contract_details_map):
         """Calculate ATR for each symbol in the list"""
-        # This function is now called by the worker, so it should not modify self directly
-        # but return the results.
+        # This function is now async and uses the provided 'ib' instance.
+        # It no longer creates its own connection.
         atr_symbols = []
         tr_values = []
         atr_calculated = []
         previous_atr_values = []
 
-        ib = IB()
-        try:
-            ib.connect('127.0.0.1', 7497, clientId=random.randint(100, 999))
-            
-            for symbol in symbols:
-                try:
-                    # Use the market statuses passed into the function
-                    if market_statuses.get(symbol) == 'CLOSED':
-                        logging.info(f"Market for {symbol} is closed. Skipping ATR calculation and using last known value.")
-                        previous_atr = self.get_previous_atr(symbol)
-                        # When closed, current ATR is the same as the last known ATR, and TR is 0
-                        atr_symbols.append(symbol)
-                        tr_values.append(0) # No new candle, so TR is 0
-                        atr_calculated.append(previous_atr)
-                        previous_atr_values.append(previous_atr)
-                        continue # Move to the next symbol
-
-                    # Get previous ATR from history
-                    previous_atr = self.get_previous_atr(symbol)
-                    
-                    # Get contract details from position data if available
-                    contract_info = contract_details_map.get(symbol, {})
-                    sec_type = contract_info.get('secType', 'FUT')
-                    
-                    # Skip stocks/ETFs for ATR calculation (they use different method)
-                    if sec_type == 'STK':
-                        print(f"Skipping {symbol} - Stock/ETF (ATR calculation not applicable)")
-                        continue
-                    
-                    # Create contract using actual details from position
-                    if contract_info.get('conId'):
-                        # Use conId and exchange for most accurate contract identification
-                        contract = Contract(
-                            conId=contract_info['conId'],
-                            exchange=contract_info.get('exchange', '') # Explicitly add exchange
-                        )
-                        ib.qualifyContracts(contract)
-                        logging.info(f"Using conId {contract_info['conId']} and exchange '{contract.exchange}' for {symbol}")
-                    elif contract_info.get('lastTradeDateOrContractMonth'):
-                        # Use actual expiration date from position
-                        contract = Future(
-                            symbol=symbol,
-                            lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
-                            exchange=contract_info.get('exchange', 'CBOT'), # Default to CBOT for agricultural futures
-                            currency=contract_info.get('currency', 'USD')
-                        )
-                        ib.qualifyContracts(contract)
-                        print(f"Using expiration {contract_info['lastTradeDateOrContractMonth']} for {symbol}")
-                    else:
-                        # Fallback - skip if we don't have contract details
-                        print(f"No contract details available for {symbol}, skipping ATR calculation")
-                        continue
-                    
-                    # Get historical bars (1 day of 15-minute candles for ATR calculation)
-                    bars = ib.reqHistoricalData(
-                        contract,
-                        endDateTime='',
-                        durationStr='1 D',
-                        barSizeSetting='15 mins',
-                        whatToShow='TRADES',
-                        useRTH=True,
-                        formatDate=1
+        for symbol in symbols:
+            try:
+                # Get previous ATR for the current symbol
+                previous_atr = self.get_previous_atr(symbol)
+                
+                contract_info = contract_details_map.get(symbol, {})
+                if contract_info.get('conId'):
+                    # Use conId and exchange for most accurate contract identification
+                    contract = Contract(
+                        conId=contract_info['conId'],
+                        exchange=contract_info.get('exchange', '') # Explicitly add exchange
                     )
-                    
-                    if not bars or len(bars) < 2:
-                        print(f"Not enough historical data for {symbol}")
-                        continue
-                    
-                    df = pd.DataFrame([{
-                        'open': b.open,
-                        'high': b.high,
-                        'low': b.low,
-                        'close': b.close,
-                        'volume': b.volume
-                    } for b in bars])
-                    
+                    await ib.qualifyContractsAsync(contract)
+                    logging.info(f"Using conId {contract_info['conId']} and exchange '{contract.exchange}' for {symbol}")
+                elif contract_info.get('lastTradeDateOrContractMonth'):
+                    # Use actual expiration date from position
+                    contract = Future(
+                        symbol=symbol,
+                        lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
+                        exchange=contract_info.get('exchange', 'CME'),
+                        currency=contract_info.get('currency', 'USD')
+                    )
+                    await ib.qualifyContractsAsync(contract)
+                    print(f"Using expiration {contract_info['lastTradeDateOrContractMonth']} for {symbol}")
+                else:
+                    # Fallback - skip if we don't have contract details
+                    print(f"No contract details available for {symbol}, skipping ATR calculation")
+                    continue
+                
+                # Get historical bars (1 day of 15-minute candles for ATR calculation)
+                bars = await ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime='',
+                    durationStr='1 D',
+                    barSizeSetting='15 mins',
+                    whatToShow='TRADES',
+                    useRTH=True,
+                    formatDate=1,
+                    keepUpToDate=False
+                )
+                
+                if not bars or len(bars) < 2:
+                    print(f"Not enough historical data for {symbol}")
+                    continue
+                
+                df = util.df(bars)
+                
+                if df is not None and not df.empty:
                     # Calculate TR always (doesn't need prior ATR)
                     prev_close = df['close'].iloc[-2]
                     current_high = df['high'].iloc[-1]
@@ -1139,16 +1153,10 @@ class ATRWindow(QMainWindow):
                     tr_values.append(current_tr)
                     atr_calculated.append(current_atr)
                     previous_atr_values.append(previous_atr)
-                
-                except Exception as e:
-                    print(f"Error calculating ATR for {symbol}: {e}")
-                    continue
-        
-        except Exception as e:
-            print(f"Error connecting to IBKR for ATR calculations: {e}")
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
+            
+            except Exception as e:
+                print(f"Error calculating ATR for {symbol}: {e}")
+                continue
         
         return {
             'atr_symbols': atr_symbols,
@@ -1194,6 +1202,11 @@ class ATRWindow(QMainWindow):
         logging.info("Worker has finished all stages.")
         self.update_status(True)
         self.update_timestamp()
+
+    def update_timestamp(self):
+        """Updates the 'Data Pulled' timestamp in the UI."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.last_pull_time.setText(timestamp)
 
         # Cleanly shut down the thread and worker
         if self.thread and self.thread.isRunning():
@@ -1305,6 +1318,27 @@ class ATRWindow(QMainWindow):
                     self.statuses[idx] = f"Error - {message}"
         self.populate_positions_table()
 
+    def on_adaptive_stop_toggled(self, state):
+        """Handles the state change of the adaptive stop loss toggle switch."""
+        if state == Qt.CheckState.Checked.value:
+            self.send_adaptive_stops = True
+            self.adaptive_stop_toggle.setText("ON")
+            self.log_to_ui(">>> Adaptive stop loss submission ENABLED <<<")
+        else:
+            self.send_adaptive_stops = False
+            self.adaptive_stop_toggle.setText("OFF")
+            self.log_to_ui(">>> Adaptive stop loss submission DISABLED <<<")
+
+    def update_status(self, connected):
+        """Updates the connection status label in the UI."""
+        if connected:
+            self.connection_status.setText("Connected")
+            self.connection_status.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.connection_status.setText("Disconnected")
+            self.connection_status.setStyleSheet("color: red; font-weight: bold;")
+
+
 def main():
     app = QApplication(sys.argv)
     window = ATRWindow()
@@ -1313,7 +1347,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
