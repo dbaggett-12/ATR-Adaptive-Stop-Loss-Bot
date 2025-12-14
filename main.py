@@ -19,6 +19,7 @@ from ib_insync import IB, util, Future, Stock, Contract, Order, StopOrder
 import math
 import pandas as pd
 
+import struct
 from decimal import Decimal, ROUND_DOWN
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -226,7 +227,8 @@ class DataWorker(QObject):
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 self.log_message.emit(f"--- [{timestamp}] Submitting Orders ---")
                 for symbol, data in orders_to_submit.items():
-                    self.log_message.emit(f"  {symbol}: Stop Price = {data['stop_price']:.4f}")
+                    stop_price = data['stop_price']
+                    self.log_message.emit(f"  {symbol}: Stop Price = {stop_price:.4f} (Raw: 0x{struct.pack('>d', stop_price).hex()})")
 
                 # Submit all orders concurrently using asyncio.gather
                 tasks = [self.submit_or_modify_order(ib, symbol, data, existing_stop_orders) for symbol, data in orders_to_submit.items()]
@@ -284,6 +286,7 @@ class DataWorker(QObject):
                     totalQuantity=total_quantity,
                     stopPrice=stop_price,
                     orderId=existing_order.orderId, # IMPORTANT: Use existing orderId to modify
+                    # transmit=False, # Optional: for manual submission flow
                     tif='GTC'
                 )
             else:
@@ -293,6 +296,7 @@ class DataWorker(QObject):
                     action=action,
                     totalQuantity=total_quantity,
                     stopPrice=stop_price,
+                    orderId=ib.client.getReqId(), # Explicitly get a new unique ID for a new order
                     tif='GTC'  # Good-Til-Canceled
                 )
 
@@ -402,10 +406,7 @@ class ATRWindow(QMainWindow):
         self.atr_history_file = os.path.join(os.path.dirname(__file__), 'atr_history.json')
         
         # Load ATR history
-        self.atr_history = self.load_atr_history()
-        
-        # Track user-submitted ATR values (symbol -> timestamp when user submitted)
-        self.user_submitted_atr = {}  # {symbol: timestamp_key}
+        self.atr_history, self.user_overrides = self.load_atr_history()
         
         # Adaptive Stop Loss toggle state
         self.send_adaptive_stops = False
@@ -824,21 +825,30 @@ class ATRWindow(QMainWindow):
         self.atr_table.cellChanged.connect(self.on_atr_changed)
 
     def load_atr_history(self):
-        """Load ATR history from JSON file"""
+        """Load ATR history and user overrides from JSON file"""
         if os.path.exists(self.atr_history_file):
             try:
                 with open(self.atr_history_file, 'r') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # For backward compatibility, handle old format
+                    if isinstance(data, dict) and 'atr_history' in data:
+                        return data.get('atr_history', {}), data.get('user_overrides', {})
+                    return data, {} # Old format, return empty overrides
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Error loading ATR history: {e}")
-                return {}
-        return {}
+                return {}, {}
+        return {}, {}
     
     def save_atr_history(self):
         """Save ATR history to JSON file"""
         try:
             with open(self.atr_history_file, 'w') as f:
-                json.dump(self.atr_history, f, indent=2)
+                # Save both history and overrides in one file
+                data_to_save = {
+                    'atr_history': self.atr_history,
+                    'user_overrides': self.user_overrides
+                }
+                json.dump(data_to_save, f, indent=2)
             logging.info("ATR history saved successfully")
         except Exception as e:
             print(f"Error saving ATR history: {e}")
@@ -911,6 +921,10 @@ class ATRWindow(QMainWindow):
             for timestamp in timestamps_to_remove:
                 del self.atr_history[symbol][timestamp]
                 logging.info(f"Removed old ATR data for {symbol} at {timestamp}")
+                # Also remove from user_overrides if it exists
+                if symbol in self.user_overrides and timestamp in self.user_overrides[symbol]:
+                    del self.user_overrides[symbol][timestamp]
+                    logging.info(f"Removed old user override for {symbol} at {timestamp}")
             
             # If symbol has no more data, mark for removal
             if not self.atr_history[symbol]:
@@ -919,6 +933,8 @@ class ATRWindow(QMainWindow):
         # Remove symbols with no data
         for symbol in symbols_to_remove:
             del self.atr_history[symbol]
+            if symbol in self.user_overrides:
+                del self.user_overrides[symbol]
             logging.info(f"Removed symbol {symbol} (no data remaining)")
         
         # Save the cleaned history
@@ -963,6 +979,13 @@ class ATRWindow(QMainWindow):
 
                 # Save the user-inputted value to history for the current interval
                 logging.info(f"User manually set ATR for {symbol} to {new_atr_value:.2f}")
+                
+                # Mark this interval as a user override
+                interval_key = self.get_15min_interval_key()
+                if symbol not in self.user_overrides:
+                    self.user_overrides[symbol] = {}
+                self.user_overrides[symbol][interval_key] = True
+
                 self.save_today_atr(symbol, new_atr_value)
 
                 # Repopulate the positions table to update computed stop loss
@@ -1111,21 +1134,15 @@ class ATRWindow(QMainWindow):
                     last_bar_time = bars[-1].date
                     completed_interval_key = self.get_15min_interval_key(last_bar_time)
                     
-                    # Check if the user has already manually entered an ATR for this interval
-                    if (symbol in self.atr_history and 
-                        completed_interval_key in self.atr_history[symbol] and
-                        symbol in self.atr_symbols):
-                        # If a manual edit happened, the value in atr_calculated is the source of truth
-                        atr_index = self.atr_symbols.index(symbol)
-                        current_atr = self.atr_calculated[atr_index]
-                        logging.info(f"User-edited ATR for {symbol} exists for interval {completed_interval_key}. Using value: {current_atr:.2f}")
-
-
-                    # Check if ATR already exists for this completed interval
-                    elif symbol in self.atr_history and completed_interval_key in self.atr_history[symbol]:
-                        # ATR already calculated for this completed interval - use existing value
+                    # Check if ATR exists and was a user override. If so, don't recalculate.
+                    is_user_override = self.user_overrides.get(symbol, {}).get(completed_interval_key, False)
+                    if is_user_override and completed_interval_key in self.atr_history.get(symbol, {}):
                         current_atr = self.atr_history[symbol][completed_interval_key]
-                        logging.info(f"Symbol: {symbol}, ATR already calculated for completed interval {completed_interval_key}: {current_atr:.2f} (skipping calculation)")
+                        logging.info(f"User override for {symbol} exists for interval {completed_interval_key}. Using value: {current_atr:.2f}")
+                    elif symbol in self.atr_history and completed_interval_key in self.atr_history[symbol] and not is_user_override:
+                        # The value was calculated previously, but it wasn't a user override, so we can re-calculate it to be safe.
+                        logging.info(f"Recalculating ATR for {symbol} for interval {completed_interval_key} as it was not a user override.")
+                        tr, current_atr = self.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
                         # Even if we skip calculation, ensure the value is saved for this interval if it's somehow missing
                         if completed_interval_key not in self.atr_history.get(symbol, {}):
                             self.atr_history[symbol][completed_interval_key] = current_atr
