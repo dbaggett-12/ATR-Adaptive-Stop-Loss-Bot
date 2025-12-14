@@ -1046,7 +1046,7 @@ class ATRWindow(QMainWindow):
                         contract = Future(
                             symbol=symbol,
                             lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
-                            exchange=contract_info.get('exchange', 'CME'), # Default to CME if not specified
+                            exchange=contract_info.get('exchange', 'CBOT'), # Default to CBOT for agricultural futures
                             currency=contract_info.get('currency', 'USD')
                         )
                         ib.qualifyContracts(contract)
@@ -1313,3 +1313,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
