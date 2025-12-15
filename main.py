@@ -1,6 +1,5 @@
 # main.py
 import sys
-import asyncio
 import logging
 import random
 import json
@@ -13,153 +12,21 @@ from PyQt6.QtWidgets import (
     QLabel, QHBoxLayout, QCheckBox
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
-from PyQt6.QtGui import QMovie
+from PyQt6.QtGui import QMovie, QColor
 from ibkr_api import get_market_statuses_for_all, fetch_basic_positions, fetch_market_data_for_positions
-from ib_insync import IB, util, Future, Stock, Contract, Order, StopOrder
+from ib_insync import IB, util, Future, Contract, StopOrder
 import math
-import pandas as pd
-
+import asyncio
 import struct
 from decimal import Decimal, ROUND_DOWN
+
+from calculator import PortfolioCalculator
+from utils import get_point_value # Import from the new utils file
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Constants ---
 ATR_HISTORY_FILE = 'atr_history.json'
-
-# --- Contract Metadata ---
-# Per-contract point values: dollar value per 1.00 displayed price move
-# For contracts quoted in cents (agricultural), this is the dollar value per 1 cent move
-# This ensures accurate dollar risk calculations across all contract types
-CONTRACT_POINT_VALUES = {
-    # Standard Index Futures
-    'ES': 50.0,      # E-mini S&P 500: $50 per point
-    'NQ': 20.0,      # E-mini Nasdaq: $20 per point
-    'YM': 5.0,       # E-mini Dow: $5 per point
-    'RTY': 50.0,     # E-mini Russell 2000: $50 per point
-    
-    # Micro Index Futures
-    'MES': 5.0,      # Micro E-mini S&P 500: $5 per point
-    'MNQ': 2.0,      # Micro E-mini Nasdaq: $2 per point
-    'MYM': 0.50,     # Micro E-mini Dow: $0.50 per point
-    'M2K': 5.0,      # Micro E-mini Russell 2000: $5 per point
-    
-    # Treasury Futures
-    'ZN': 1000.0,    # 10-Year T-Note: $1000 per point
-    'ZB': 1000.0,    # 30-Year T-Bond: $1000 per point
-    'ZF': 1000.0,    # 5-Year T-Note: $1000 per point
-    'ZT': 2000.0,    # 2-Year T-Note: $2000 per point
-    
-    # Micro Treasury Futures
-    'MZN': 100.0,    # Micro 10-Year Yield: $100 per point (10 × $10)
-    '10Y': 1000.0,   # Micro 10-Year Yield: $1000 per 1.00 point move in yield
-    '2YY': 2000.0,   # Micro 2-Year Yield: $2000 per 1.00 point move in yield
-    '30Y': 1000.0,   # Micro 30-Year Yield: $1000 per 1.00 point move in yield
-    
-    # Agricultural Futures (prices displayed in cents, e.g., 450.25 = 450.25 cents/bushel)
-    # Point value = contract size (bushels/lbs) × $0.01 per cent
-    # A 1.00 displayed price move = 1 cent = point_value dollars
-    'ZC': 50.0,      # Corn: 5000 bushels × $0.01 = $50 per 1 cent (1.00 displayed)
-    'ZS': 50.0,      # Soybeans: 5000 bushels × $0.01 = $50 per 1 cent
-    'ZW': 50.0,      # Wheat: 5000 bushels × $0.01 = $50 per 1 cent
-    'ZM': 100.0,     # Soybean Meal: 100 tons × $1.00 = $100 per point (quoted in $/ton)
-    'ZL': 600.0,     # Soybean Oil: 60000 lbs × $0.01 = $600 per 1 cent move
-    'HE': 400.0,     # Lean Hogs: 40000 lbs × $0.01 = $400 per 1 cent move
-    'LE': 400.0,     # Live Cattle: 40000 lbs × $0.01 = $400 per 1 cent move
-    'GF': 500.0,     # Feeder Cattle: 50000 lbs × $0.01 = $500 per 1 cent move
-    
-    # Micro Agricultural Futures (1/10th of standard)
-    'MZC': 5.0,      # Micro Corn: 500 bushels × $0.01 = $5 per 1 cent move
-    'MZS': 10.0,     # Micro Soybeans: 1000 bushels × $0.01 = $10 per 1 cent move
-    'MZW': 5.0,      # Micro Wheat: 500 bushels × $0.01 = $5 per 1 cent move
-    'MZM': 10.0,     # Micro Soybean Meal: 10 tons × $1.00 = $10 per point
-    'MZL': 60.0,     # Micro Soybean Oil: 6000 lbs × $0.01 = $60 per 1 cent move
-    
-    # Metals
-    'GC': 100.0,     # Gold: 100 oz × $1.00 = $100 per point
-    'SI': 5000.0,    # Silver: 5000 oz × $1.00 = $5000 per point
-    'HG': 25000.0,   # Copper: 25000 lbs. Price is in cents, so a 1.00 move (1 cent) is 25000 * $0.01 = $250.
-    'PL': 50.0,      # Platinum: 50 oz × $1.00 = $50 per point
-    
-    # Micro Metals
-    'MGC': 10.0,     # Micro Gold: 10 oz × $1.00 = $10 per point
-    'SIL': 1000.0,   # Micro Silver: 1000 oz × $1.00 = $1000 per point
-    'MHG': 2500.0,   # Micro Copper: 2500 lbs. Price is in cents, so a 1.00 move (1 cent) is 2500 * $0.01 = $25.
-    
-    # Energy
-    'CL': 1000.0,    # Crude Oil: 1000 barrels × $1.00 = $1000 per point
-    'NG': 10000.0,   # Natural Gas: 10000 MMBtu × $1.00 = $10000 per point
-    'RB': 420.0,     # RBOB Gasoline: 42000 gallons × $0.01 = $420 per 1 cent
-    'HO': 420.0,     # Heating Oil: 42000 gallons × $0.01 = $420 per 1 cent
-    
-    # Micro Energy
-    'MCL': 100.0,    # Micro Crude Oil: 100 barrels × $1.00 = $100 per point
-    'MNG': 1000.0,   # Micro Natural Gas: 1000 MMBtu × $1.00 = $1000 per point
-    
-    # Currency Futures
-    'EUR': 125000.0, # Euro FX: 125000 EUR × $1.00 = $125000 per point
-    '6E': 125000.0,  # Euro FX (CME symbol): same as EUR
-    '6J': 12500000.0,# Japanese Yen: 12500000 JPY × $0.000001 = $12.50 per tick
-    '6B': 62500.0,   # British Pound: 62500 GBP × $1.00 = $62500 per point
-    '6A': 100000.0,  # Australian Dollar: 100000 AUD × $1.00 = $100000 per point
-    '6C': 100000.0,  # Canadian Dollar: 100000 CAD × $1.00 = $100000 per point
-    
-    # Micro Currency Futures
-    'M6E': 12500.0,  # Micro Euro: 12500 EUR × $1.00 = $12500 per point
-}
-
-
-def get_point_value(symbol, contract_details, multiplier):
-    """
-    Get the dollar value per 1.00 price move for a contract.
-    
-    Uses explicit metadata first, then falls back to deriving from contract details.
-    
-    Args:
-        symbol: The contract symbol (e.g., 'ES', 'MZN', 'ZC')
-        contract_details: Dict with priceMagnifier, mdSizeMultiplier, etc.
-        multiplier: The contract multiplier from IBKR
-    
-    Returns:
-        float: Dollar value per 1.00 price move
-    """
-    # First, check the explicit metadata dictionary
-    if symbol in CONTRACT_POINT_VALUES:
-        return CONTRACT_POINT_VALUES[symbol]
-    
-    # Fallback: try to derive from contract details
-    price_magnifier = contract_details.get('priceMagnifier', 1)
-    md_size_multiplier = contract_details.get('mdSizeMultiplier')
-    
-    # Case 1: Contracts quoted in cents (e.g., agricultural, some metals)
-    # For these, the priceMagnifier is often > 1 (e.g., 100).
-    # The mdSizeMultiplier usually represents the contract size (e.g., 5000 bushels for ZC).
-    # The point value per 1-cent move is (mdSizeMultiplier * $0.01).
-    # Since a 1.00 price move *is* a 1-cent move, we need to divide by the magnifier
-    # to get the value per dollar, then multiply by the contract size.
-    # Simplified: point_value = mdSizeMultiplier / priceMagnifier
-    if price_magnifier > 1 and md_size_multiplier is not None:
-        # For contracts like ZC (Corn): 5000 / 100 = $50 per 1-cent move.
-        # For HG (Copper): 25000 / 100 = $250 per 1-cent move.
-        point_value = float(md_size_multiplier) / price_magnifier
-        logging.warning(f"Unknown contract {symbol}. Derived point value: ${point_value:.2f} "
-                       f"(mdSizeMultiplier={md_size_multiplier}, priceMagnifier={price_magnifier}). "
-                       f"Consider adding to CONTRACT_POINT_VALUES.")
-        return point_value
-    
-    # Case 2: Contracts where mdSizeMultiplier represents point value
-    elif md_size_multiplier is not None and md_size_multiplier > 1:
-        point_value = float(md_size_multiplier)
-        logging.warning(f"Unknown contract {symbol}. Using mdSizeMultiplier as point value: ${point_value:.2f}. "
-                       f"Consider adding to CONTRACT_POINT_VALUES.")
-        return point_value
-    
-    # Case 3: Standard contracts where multiplier is the point value
-    else:
-        point_value = multiplier if multiplier > 0 else 1.0
-        logging.warning(f"Unknown contract {symbol}. Using multiplier as point value: ${point_value:.2f}. "
-                       f"Consider adding to CONTRACT_POINT_VALUES.")
-        return point_value
 
 
 class DataWorker(QObject):
@@ -169,19 +36,16 @@ class DataWorker(QObject):
     """
     finished = pyqtSignal()
     error = pyqtSignal(str)
-    positions_ready = pyqtSignal(list)
-    market_data_ready = pyqtSignal(list)
-    atr_ready = pyqtSignal(dict)
+    # This single signal will carry all the calculated data for the UI
+    data_ready = pyqtSignal(list)
     orders_submitted = pyqtSignal(list)
     log_message = pyqtSignal(str) # Signal to send log messages to the UI
     
-    def __init__(self, atr_window, atr_ratios, highest_stop_losses):
+    def __init__(self, atr_window):
         super().__init__()
         # Give worker access to the main window's methods and data
         self.atr_window = atr_window
         self.send_adaptive_stops = atr_window.send_adaptive_stops
-        self.atr_ratios = atr_ratios
-        self.highest_stop_losses = highest_stop_losses
         self.symbol_stop_enabled = atr_window.symbol_stop_enabled
 
     async def run_async(self):
@@ -195,20 +59,31 @@ class DataWorker(QObject):
             # Using reqPositionsAsync for non-blocking behavior
             positions = await ib.reqPositionsAsync()
             basic_positions = await fetch_basic_positions(ib, positions)
-            self.positions_ready.emit(basic_positions)
             
             # --- Stage 2: Fetch Market Data ---
             enriched_positions = await fetch_market_data_for_positions(ib, basic_positions)
-            self.market_data_ready.emit(enriched_positions)
             
-            # --- Stage 3: Calculate ATR ---
+            # --- Stage 3: Calculations (ATR, Stops, Risk) ---
             contract_details_map = {p['symbol']: p['contract_details'] for p in enriched_positions}
             market_statuses = await get_market_statuses_for_all(ib, contract_details_map)
             self.atr_window.market_statuses = market_statuses # Update main window
             
             symbols = [p['symbol'] for p in enriched_positions]
             atr_results = await self.atr_window.calculate_atr_for_symbols(ib, symbols, market_statuses, contract_details_map)
-            self.atr_ready.emit(atr_results)
+
+            # --- Instantiate and use the calculator ---
+            # Pass copies of state to ensure thread safety
+            atr_ratios_map = {p['symbol']: self.atr_window.get_atr_ratio_for_symbol(p['symbol']) for p in enriched_positions}
+            
+            calculator = PortfolioCalculator(
+                self.atr_window.atr_history.copy(),
+                self.atr_window.user_overrides.copy(),
+                self.atr_window.highest_stop_losses.copy(),
+                atr_ratios_map,
+                market_statuses
+            )
+            final_positions_data = calculator.process_positions(enriched_positions, atr_results)
+            self.data_ready.emit(final_positions_data)
 
             # --- Stage 4: Submit Orders ---
             # Read the latest state of the toggle directly from the window
@@ -218,8 +93,7 @@ class DataWorker(QObject):
                 return
 
             # The main window now holds the definitive list of positions
-            self.atr_window.positions_data = enriched_positions
-            stop_loss_data = self.build_stop_loss_data()
+            stop_loss_data = self.build_stop_loss_data(final_positions_data)
             final_results = stop_loss_data.get('statuses_only', [])
             orders_to_submit = stop_loss_data.get('orders_to_submit', {})
             
@@ -332,19 +206,14 @@ class DataWorker(QObject):
             return {'symbol': symbol, 'status': 'error', 'message': str(e)}
 
 
-    def build_stop_loss_data(self):
+    def build_stop_loss_data(self, processed_positions):
         """Prepares the data structure for submitting stop loss orders."""
         orders_to_submit = {}
         statuses_only = []
 
-        # Use the position data from the main window, which was set by the worker
-        for i, p_data in enumerate(self.atr_window.positions_data):
+        for p_data in processed_positions:
             symbol = p_data['symbol']
-            
-            # Use the already computed stop loss from the UI table's data model.
-            # This ensures that what the user sees is what gets submitted.
-            # The ratcheting logic is already applied when this value is calculated for the UI.
-            final_stop_price = self.atr_window.computed_stop_losses[i] if i < len(self.atr_window.computed_stop_losses) else 0
+            final_stop_price = p_data.get('computed_stop_loss', 0)
 
             # Get the highest stop loss recorded to check if we should hold.
             # This is a safety check. The primary logic is now driven by the UI-calculated value.
@@ -360,7 +229,6 @@ class DataWorker(QObject):
                 })
                 continue
 
-
             if final_stop_price <= 0:
                 logging.info(f"Worker: Skipping {symbol}: No valid stop price computed.")
                 statuses_only.append({
@@ -370,12 +238,16 @@ class DataWorker(QObject):
                 })
                 continue
 
-            # Ratchet check: if the new stop is lower than the highest one, hold the order
-            if highest_stop > 0 and final_stop_price < highest_stop:
-                logging.info(f"Worker: Holding stop for {symbol}. New stop {final_stop_price:.4f} is lower than existing {highest_stop:.4f}")
+            # Ratchet check: The calculator already applied this logic.
+            # We just need to check if the final stop price is the same as the held-over one.
+            is_long = p_data['positions_held'] > 0
+            held_stop = (is_long and final_stop_price < p_data['current_price'] and final_stop_price == highest_stop) or \
+                        (not is_long and final_stop_price > p_data['current_price'] and final_stop_price == highest_stop)
+
+            if held_stop and final_stop_price != 0:
+                logging.info(f"Worker: Holding stop for {symbol} at {final_stop_price:.4f}")
                 statuses_only.append({
                     'symbol': symbol,
-                    'status': 'held',
                     'message': 'Stop Held'
                 })
                 continue
@@ -392,22 +264,11 @@ class ATRWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("ATR Adaptive Stop Bot")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1400, 800)
 
-        # Placeholder data lists
-        self.positions = []
-        self.atr_values = []
-        self.atr_ratios = []
-        self.statuses = []
-        self.symbols = []
-        self.positions_held = []
-        self.current_prices = []
-        self.multipliers = []
-        self.computed_stop_losses = []  # Current computed stop losses
-        self.all_positions_details = [] # Store full position dictionaries
+        # Data stores
+        self.positions_data = [] # This will hold the fully processed data from the worker
         self.highest_stop_losses = {}  # Track highest stop loss per symbol (never goes down)
-        self.thread = None # Initialize thread attribute to None
-        self.positions_data = [] # Store latest enriched position data for order submission
         self.contract_details_map = {}  # Store contract details by symbol
         self.symbol_stop_enabled = {}  # {symbol: bool} to track individual stop toggles
 
@@ -416,11 +277,6 @@ class ATRWindow(QMainWindow):
         self.tr_values = []
         self.atr_calculated = []
         self.previous_atr_values = []
-        self.previous_atr_sources = []  # Track if value is "Calculated" or "User Inputted"
-
-        # Track last market data values for each symbol to detect market closures
-        self.last_market_data = {}  # {symbol: {'high': float, 'low': float, 'prev_close': float}}
-        
         # ATR history file path
         self.atr_history_file = os.path.join(os.path.dirname(__file__), 'atr_history.json')
         
@@ -434,6 +290,9 @@ class ATRWindow(QMainWindow):
         # Adaptive Stop Loss toggle state
         self.send_adaptive_stops = False
         self.market_statuses = {}  # {symbol: 'OPEN' | 'CLOSED' | 'UNKNOWN'}
+
+        # Threading
+        self.worker_thread = None
 
         # Central widget & layout
         central_widget = QWidget()
@@ -530,7 +389,7 @@ class ATRWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.setColumnWidth(0, 50) # "Send" column
-        self.table.setColumnWidth(9, 240) # "Status" column
+        self.table.setColumnWidth(9, 180) # "Status" column
         self.positions_layout.addWidget(self.table)
 
         # --- Raw Data Tab ---
@@ -578,99 +437,22 @@ class ATRWindow(QMainWindow):
         properly shut down before the application exits.
         """
         logging.info("Close event triggered. Attempting to stop worker thread...")
-        # Check if a worker thread exists and is running
-        if hasattr(self, 'thread') and self.thread and self.thread.isRunning():
-            self.thread.quit()  # Ask the thread's event loop to exit
-            if not self.thread.wait(5000):  # Wait up to 5 seconds for the thread to finish
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            if not self.worker_thread.wait(5000):
                 logging.warning("Worker thread did not terminate gracefully. Forcing termination.")
-                self.thread.terminate() # As a last resort
+                self.worker_thread.terminate()
 
         self.save_user_settings() # Save checkbox states on exit
-
         event.accept() # Proceed with closing the window
 
-    def calculate_tr_and_atr(self, df, prior_atr, symbol=None):
-        """
-        Calculate True Range (TR) and Average True Range (ATR) for a given dataframe.
-        
-        Uses 15-minute candle data:
-        - Current high/low are from the current 15-minute candle
-        - Previous close is from the previous 15-minute candle
-        
-        TR is the maximum of:
-        - Current High - Current Low
-        - |Current High - Previous Close|
-        - |Current Low - Previous Close|
-        
-        ATR is calculated using exponential smoothing:
-        ATR = (Prior ATR × 13 + Current TR) / 14
-        
-        If the market data values (high, low, prev_close) are the same as the previous
-        calculation, this indicates a market closure and the previous ATR is reused.
-        
-        Args:
-            df: DataFrame with columns 'high', 'low', 'close' (15-minute candles)
-            prior_atr: The previous ATR value (from previous 15-minute interval)
-            symbol: Optional symbol name for tracking market data changes
-        
-        Returns:
-            tuple: (current_tr, current_atr) or (None, None) if insufficient data
-        """
-        if len(df) < 2:
-            return None, None
-
-        # Get a definitive market status instead of inferring it from price data
-        if symbol:
-            if self.market_statuses.get(symbol) == 'CLOSED':
-                logging.info(f"Market for {symbol} is CLOSED. Reusing previous ATR: {prior_atr:.2f}")
-                # We still calculate TR for display, but return the prior ATR
-                prev_close = df['close'].iloc[-2]
-                current_high = df['high'].iloc[-1]
-                current_low = df['low'].iloc[-1]
-                current_tr = max(current_high - current_low, abs(current_high - prev_close), abs(current_low - prev_close))
-                return current_tr, prior_atr
-
-        # Calculate current TR
-        prev_close = df['close'].iloc[-2]
-        current_high = df['high'].iloc[-1]
-        current_low = df['low'].iloc[-1]
-
-        # True Range (current)
-        tr1 = current_high - current_low
-        tr2 = abs(current_high - prev_close)
-        tr3 = abs(current_low - prev_close)
-        current_tr = max(tr1, tr2, tr3)
-
-        # If TR is 0, keep ATR unchanged
-        if current_tr == 0:
-            print(f"TR is 0 for {symbol if symbol else 'symbol'} - keeping ATR unchanged at {prior_atr:.2f}")
-            return current_tr, prior_atr
-
-        # ATR using the calculated prior ATR from previous 15-minute interval
-        # Formula: ATR = (Prior ATR × 13 + Current TR) / 14
-        current_atr = (prior_atr * 13 + current_tr) / 14
-
-        # Fallback for when prior_atr is None (e.g., first run for a symbol)
-        if prior_atr is None:
-            logging.warning(f"No prior ATR for {symbol}. Calculating ATR from historical bars.")
-            try:
-                # Use the ib_insync utility to calculate ATR from the full bar series
-                atr_series = util.ATR(df['high'], df['low'], df['close'], 14)
-                if atr_series is not None and not atr_series.empty:
-                    current_atr = atr_series.iloc[-1] # Get the most recent ATR value
-            except Exception as e:
-                logging.error(f"Error during fallback ATR calculation for {symbol}: {e}")
-                return current_tr, None # Return None if fallback fails
-        return current_tr, current_atr
-
     def populate_positions_table(self):
-        self.table.setRowCount(len(self.all_positions_details))
-        for i, p_data in enumerate(self.all_positions_details):
+        """Populates the main table with fully processed data. No calculations here."""
+        self.table.setRowCount(len(self.positions_data))
+        for i, p_data in enumerate(self.positions_data):
             try:
-                pos = p_data['position']
                 symbol = p_data['symbol']
                 
-                # Column 0: Position
                 # Column 0: "Send Stop" Checkbox
                 checkbox_widget = QWidget()
                 checkbox_layout = QHBoxLayout(checkbox_widget)
@@ -683,8 +465,8 @@ class ATRWindow(QMainWindow):
                 self.table.setCellWidget(i, 0, checkbox_widget)
 
                 # Column 1: Position
-                market_status = self.market_statuses.get(symbol, 'UNKNOWN')
-                position_item = QTableWidgetItem(pos)
+                market_status = self.market_statuses.get(symbol, 'UNKNOWN') # From main window state
+                position_item = QTableWidgetItem(p_data['position'])
 
                 # Create a colored circle icon
                 pixmap = QtGui.QPixmap(16, 16)
@@ -700,14 +482,9 @@ class ATRWindow(QMainWindow):
                 self.table.setItem(i, 1, position_item)
                 
                 # Column 2: ATR - Get ATR value from ATR calculations tab
-                atr_value = None
-                atr_display = "N/A"
-                if symbol in self.atr_symbols: # Use the full precision ATR value for calculation
-                    atr_index = self.atr_symbols.index(symbol)
-                    if self.atr_calculated[atr_index] is not None:
-                        atr_value = self.atr_calculated[atr_index]
-                        atr_display = f"{atr_value:.4f}" # Display with more precision
-                self.table.setItem(i, 2, QTableWidgetItem(atr_display))
+                atr_value = p_data.get('atr_value')
+                atr_display = f"{atr_value:.4f}" if atr_value is not None else "N/A"
+                self.table.setItem(i, 2, QTableWidgetItem(atr_display)) # Display with more precision
 
                 # Column 3: ATR Ratio editable spin box
                 spin = QDoubleSpinBox()
@@ -715,7 +492,7 @@ class ATRWindow(QMainWindow):
                 spin.setMaximum(10.0)
                 spin.setSingleStep(0.1)
                 spin.setDecimals(1)
-                spin.setValue(self.atr_ratios[i])
+                spin.setValue(p_data.get('atr_ratio', 1.5))
                 spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
                 spin.valueChanged.connect(lambda val, row=i: self.update_atr_ratio(row, val))
                 self.table.setCellWidget(i, 3, spin)
@@ -724,50 +501,30 @@ class ATRWindow(QMainWindow):
                 self.table.setItem(i, 4, QTableWidgetItem(str(p_data['positions_held'])))
                 
                 # Column 5: Current Price
-                self.table.setItem(i, 5, QTableWidgetItem(f"{p_data['current_price']:.2f}"))
+                self.table.setItem(i, 5, QTableWidgetItem(f"{p_data.get('current_price', 0):.2f}"))
 
-                # Column 6: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
-                # Stop loss never goes down - use highest computed value
-                computed_stop = self.compute_stop_loss(p_data, p_data['current_price'], atr_value, self.atr_ratios[i])
-                self.computed_stop_losses[i] = computed_stop # Store the final computed stop
-                stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
+                # Column 6: Computed Stop Loss
+                computed_stop = p_data.get('computed_stop_loss')
+                stop_display = f"{computed_stop:.4f}" if computed_stop is not None else "N/A"
+                stop_item = QTableWidgetItem(stop_display)
                 self.table.setItem(i, 6, stop_item)
 
-                # Column 7: $ Risk (MinTick column was removed)
-                contract_details = p_data.get('contract_details', {})
-                risk_value = 0
-                if computed_stop and p_data['current_price'] > 0:
-                    risk_in_points = p_data['current_price'] - computed_stop
-                    # Ensure risk_in_points is always positive, as risk is an absolute value
-                    risk_in_points = abs(risk_in_points)
-
-                    multiplier = p_data.get('multiplier', 1.0)
-
-                    # Use the centralized get_point_value function for accurate dollar risk calculation
-                    # This uses explicit per-contract metadata when available, with fallback logic
-                    point_value = get_point_value(symbol, contract_details, multiplier)
-
-                    # Total Risk = (Absolute Price Difference) * (Point Value) * (Quantity)
-                    risk_value = risk_in_points * point_value * abs(p_data['positions_held'])
+                # Column 7: $ Risk
+                risk_value = p_data.get('dollar_risk', 0)
                 risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
                 self.table.setItem(i, 7, risk_item)
 
                 # Column 8: % Risk
-                hypothetical_account_value = 6000.0
-                percent_risk = 0.0
-                if hypothetical_account_value > 0:
-                    percent_risk = (risk_value / hypothetical_account_value) * 100
+                percent_risk = p_data.get('percent_risk', 0.0)
                 percent_risk_item = QTableWidgetItem(f"{percent_risk:.2f}%")
 
-                # Turn the text red if risk is over 2%
                 if percent_risk > 2.0:
-                    percent_risk_item.setForeground(QtGui.QColor('red'))
-
+                    percent_risk_item.setForeground(QColor('red'))
                 self.table.setItem(i, 8, percent_risk_item)
 
                 # Column 9: Status
-                # Note: self.statuses[i] corresponds to the index of the symbol in self.symbols, not necessarily p_data
-                self.table.setItem(i, 9, QTableWidgetItem(self.statuses[i]))
+                self.table.setItem(i, 9, QTableWidgetItem(p_data.get('status', '...')))
+
             except Exception as e:
                 symbol = p_data.get('symbol', 'UNKNOWN')
                 logging.error(f"Error populating table for symbol {symbol}: {e}")
@@ -776,6 +533,14 @@ class ATRWindow(QMainWindow):
                 error_item.setForeground(QtGui.QColor('red'))
                 self.table.setItem(i, 1, QTableWidgetItem(symbol))
                 self.table.setItem(i, 9, error_item)
+
+    def get_atr_ratio_for_symbol(self, symbol):
+        """Finds the ATR ratio for a symbol from the UI table."""
+        for i in range(self.table.rowCount()):
+            if self.table.item(i, 1) and self.table.item(i, 1).text() == symbol:
+                spin_box = self.table.cellWidget(i, 3)
+                return spin_box.value() if spin_box else 1.5
+        return 1.5 # Default
 
     def load_user_settings(self):
         """Load user settings from user_settings.json"""
@@ -807,52 +572,6 @@ class ATRWindow(QMainWindow):
         is_enabled = state == Qt.CheckState.Checked.value
         self.symbol_stop_enabled[symbol] = is_enabled
         logging.info(f"Stop loss submission for {symbol} set to: {'ENABLED' if is_enabled else 'DISABLED'}")
-
-    def compute_stop_loss(self, position_data, current_price, atr_value, atr_ratio, apply_ratchet=True):
-        """
-        Compute stop loss = Current Price - (ATR × ATR Ratio)
-        - Stop loss never goes down (ratchets up).
-        - Rounds to the contract's minimum tick size.
-        - Rounds down for long positions (SELL stop), up for short positions (BUY stop).
-        - `apply_ratchet` flag controls whether to enforce the "never goes down" rule.
-        """
-        symbol = position_data['symbol']
-
-        if atr_value is None or current_price <= 0:
-            return self.highest_stop_losses.get(symbol, 0)
-        
-        # --- Calculate Stop Price and Round to minTick using Decimal for precision ---
-        raw_stop = current_price - (atr_value * atr_ratio)
-        
-        contract_details = position_data.get('contract_details', {})
-        min_tick = contract_details.get('minTick') 
-        quantity = position_data.get('positions_held', 0)
-
-        final_stop = float(raw_stop) # Default to float if no rounding is needed
-        if min_tick > 0 and quantity != 0:
-            # Use Decimal for accurate rounding to the specified tick size.
-            # We round down to be more conservative (lower stop for longs, higher stop for shorts is handled by the subtraction).
-            # A lower SELL stop or a lower BUY stop (for shorts) is always safer.
-            raw_stop_decimal = Decimal(str(raw_stop))
-            min_tick_decimal = Decimal(str(min_tick))
-            
-            # Perform rounding: (value / tick_size).quantize(ROUND_DOWN) * tick_size
-            rounded_stop_decimal = (raw_stop_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * min_tick_decimal
-            final_stop = float(rounded_stop_decimal)
-            logging.debug(f"Rounding for {symbol}: raw={raw_stop}, minTick={min_tick}, final={final_stop}")
-
-        # Get previous highest stop loss for this symbol
-        prev_highest = self.highest_stop_losses.get(symbol, 0)
-        
-        if apply_ratchet:
-            # Stop loss never goes down - use max of new and previous
-            if final_stop > prev_highest:
-                self.highest_stop_losses[symbol] = final_stop
-                return final_stop
-            else:
-                return prev_highest
-        else:
-            return final_stop # Return the raw computed value if not ratcheting
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
@@ -1046,7 +765,7 @@ class ATRWindow(QMainWindow):
                 # Mark this interval as a user override
                 interval_key = self.get_15min_interval_key()
                 if symbol not in self.user_overrides:
-                    self.user_overrides[symbol] = {}
+                    self.user_overrides[symbol] = {} # pyright: ignore
                 self.user_overrides[symbol][interval_key] = True
 
                 self.save_today_atr(symbol, new_atr_value)
@@ -1113,7 +832,7 @@ class ATRWindow(QMainWindow):
         
         if bars and len(bars) >= 2:
             df = util.df(bars)
-            tr, atr = self.calculate_tr_and_atr(df, prior_atr=prior_atr, symbol=symbol)
+            tr, atr = PortfolioCalculator(None, None, None, None, self.market_statuses).calculate_tr_and_atr(df, prior_atr=prior_atr, symbol=symbol)
 
             if tr is not None and atr is not None:
                 # Since this runs in a background thread, we need to update UI elements
@@ -1125,12 +844,13 @@ class ATRWindow(QMainWindow):
     async def calculate_atr_for_symbols(self, ib, symbols, market_statuses, contract_details_map):
         """Calculate ATR for each symbol in the list"""
         # This function is now async and uses the provided 'ib' instance.
-        # It no longer creates its own connection.
-        atr_symbols = []
-        tr_values = []
-        atr_calculated = []
-        previous_atr_values = []
+        # It returns a list of dictionaries, one for each symbol.
+        results = []
+        calculator = PortfolioCalculator(
+            self.atr_history, self.user_overrides, self.highest_stop_losses, {}, market_statuses
+        )
 
+        tasks = []
         for symbol in symbols:
             try:
                 # Get previous ATR for the current symbol
@@ -1201,11 +921,11 @@ class ATRWindow(QMainWindow):
                     is_user_override = self.user_overrides.get(symbol, {}).get(completed_interval_key, False)
                     if is_user_override and completed_interval_key in self.atr_history.get(symbol, {}):
                         current_atr = self.atr_history[symbol][completed_interval_key]
-                        logging.info(f"User override for {symbol} exists for interval {completed_interval_key}. Using value: {current_atr:.2f}")
+                        logging.info(f"User override for {symbol} exists for interval {completed_interval_key}. Using value: {current_atr:.4f}")
                     elif symbol in self.atr_history and completed_interval_key in self.atr_history[symbol] and not is_user_override:
                         # The value was calculated previously, but it wasn't a user override, so we can re-calculate it to be safe.
                         logging.info(f"Recalculating ATR for {symbol} for interval {completed_interval_key} as it was not a user override.")
-                        tr, current_atr = self.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
+                        tr, current_atr = calculator.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
                         # Even if we skip calculation, ensure the value is saved for this interval if it's somehow missing
                         if completed_interval_key not in self.atr_history.get(symbol, {}):
                             self.atr_history[symbol][completed_interval_key] = current_atr
@@ -1213,10 +933,10 @@ class ATRWindow(QMainWindow):
 
                     elif previous_atr is not None:
                         # Calculate new ATR for the completed interval
-                        tr, current_atr = self.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
+                        tr, current_atr = calculator.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
                         logging.info(f"Symbol: {symbol}, Calculating ATR for completed interval {completed_interval_key}")
-                        logging.info(f"  Previous ATR: {previous_atr:.2f}, TR: {tr:.2f}, New ATR: {current_atr:.2f}")
-                        
+                        logging.info(f"  Previous ATR: {previous_atr:.4f}, TR: {tr:.4f}, New ATR: {current_atr:.4f}")
+
                         # Save ATR for the completed interval
                         if symbol not in self.atr_history:
                             self.atr_history[symbol] = {}
@@ -1224,26 +944,20 @@ class ATRWindow(QMainWindow):
                         self.save_atr_history()
                     else:
                         # If there's no previous ATR, we can't calculate a new one.
-                        current_atr = None
-                        logging.warning(f"Symbol: {symbol}, TR: {current_tr:.2f}, ATR: N/A (No previous ATR from 15-min interval)")
+                        _, current_atr = calculator.calculate_tr_and_atr(df, prior_atr=previous_atr, symbol=symbol)
+                        logging.warning(f"Symbol: {symbol}, TR: {current_tr:.4f}, ATR: N/A (No previous ATR from 15-min interval)")
 
-                    
-                    # Store the values
-                    atr_symbols.append(symbol)
-                    tr_values.append(current_tr)
-                    atr_calculated.append(current_atr)
-                    previous_atr_values.append(previous_atr)
+                    results.append({
+                        'symbol': symbol,
+                        'tr': current_tr,
+                        'atr': current_atr,
+                        'previous_atr': previous_atr
+                    })
             
             except Exception as e:
                 print(f"Error calculating ATR for {symbol}: {e}")
                 continue
-        
-        return {
-            'atr_symbols': atr_symbols,
-            'tr_values': tr_values,
-            'atr_calculated': atr_calculated,
-            'previous_atr_values': previous_atr_values
-        }
+        return results
 
     def start_full_refresh(self):
         """Starts the first stage of the data loading sequence."""
@@ -1254,27 +968,24 @@ class ATRWindow(QMainWindow):
 
     def start_worker(self):
         """Creates and starts a single worker for the entire refresh cycle."""
-        # If a thread is already running, don't start a new one.
-        if hasattr(self, 'thread') and self.thread and self.thread.isRunning():
+        if self.worker_thread and self.worker_thread.isRunning():
             logging.warning("Refresh already in progress. Skipping new request.")
             return
 
-        self.thread = QThread()
-        self.worker = DataWorker(self, self.atr_ratios, self.highest_stop_losses) # self.symbol_stop_enabled is now passed via `self`
-        self.worker.moveToThread(self.thread)
+        self.worker_thread = QThread()
+        self.worker = DataWorker(self)
+        self.worker.moveToThread(self.worker_thread)
 
-        self.thread.started.connect(self.worker.run)
+        self.worker_thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.error.connect(self.handle_data_error)
         self.worker.log_message.connect(self.log_to_ui)
 
-        # Connect all signals at once
-        self.worker.positions_ready.connect(self.handle_positions_ready)
-        self.worker.market_data_ready.connect(self.handle_market_data_ready)
-        self.worker.atr_ready.connect(self.handle_atr_ready)
+        # Connect the new consolidated signal
+        self.worker.data_ready.connect(self.handle_data_ready)
         self.worker.orders_submitted.connect(self.handle_orders_submitted)
 
-        self.thread.start()
+        self.worker_thread.start()
         logging.info("Worker started for full refresh cycle.")
 
     def on_worker_finished(self):
@@ -1289,78 +1000,47 @@ class ATRWindow(QMainWindow):
         self.last_pull_time.setText(timestamp)
 
         # Cleanly shut down the thread and worker
-        if self.thread and self.thread.isRunning():
-            self.thread.quit()
-            self.thread.wait()
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            self.worker_thread.wait()
         
-        if hasattr(self, 'worker') and self.worker:
-            # Schedule for deletion and clear the Python reference
-            self.worker.deleteLater()
-            self.worker = None
-        if hasattr(self, 'thread') and self.thread:
-            # Schedule for deletion and clear the Python reference
-            self.thread.deleteLater()
-            self.thread = None
+        self.worker_thread.deleteLater()
+        self.worker.deleteLater()
+        self.worker_thread = None
 
-    def handle_positions_ready(self, positions_data):
-        """Stage 1: Basic positions are ready. Populate table with what we have."""
-        logging.info(f"Stage 1 Complete: Received {len(positions_data)} basic positions.")
+    def handle_data_ready(self, positions_data):
+        """Handles the fully processed data from the worker."""
+        logging.info(f"Data ready: Received {len(positions_data)} fully processed positions.")
         if not positions_data:
             self.raw_data_view.setPlainText("No positions returned from IBKR")
             self.table.setRowCount(0)
             self.atr_table.setRowCount(0)
             return
-        
-        self.update_ui_with_position_data(positions_data)
 
-    def handle_market_data_ready(self, positions_data):
-        """Stage 2: Market data is ready. Repopulate table with prices."""
-        logging.info("Stage 2 Complete: Received market data.")
-        self.positions_data = positions_data # Store the latest data
-        self.update_ui_with_position_data(positions_data)
+        self.positions_data = positions_data
 
-    def handle_atr_ready(self, atr_results):
-        """Stage 3: ATR data is ready. Populate ATR table and update positions table."""
-        logging.info("Stage 3 Complete: Received ATR calculations.")
-        self.atr_symbols = atr_results.get('atr_symbols', [])
-        self.tr_values = atr_results.get('tr_values', [])
-        self.atr_calculated = atr_results.get('atr_calculated', [])
-        self.previous_atr_values = atr_results.get('previous_atr_values', [])
+        # Update ATR table data from the processed positions
+        self.atr_symbols = [p['symbol'] for p in self.positions_data]
+        self.tr_values = [p.get('tr', 0) for p in self.positions_data] # Assuming TR is added to p_data
+        self.atr_calculated = [p.get('atr_value') for p in self.positions_data]
+        self.previous_atr_values = [p.get('previous_atr') for p in self.positions_data] # Assuming this is added
+
+        # Update UI
+        self.update_raw_data_view()
         self.populate_atr_table()
-        self.populate_positions_table() # Re-populate to show ATR and computed stops
+        self.populate_positions_table()
 
     def handle_orders_submitted(self, order_results):
         """Stage 4: Order submission is complete. Update statuses."""
         logging.info("Stage 4 Complete: Processed order submissions.")
         self.process_order_results(order_results)
+        self.populate_positions_table() # Repopulate to show final statuses
 
-    def update_ui_with_position_data(self, positions_data):
-        """A helper to update UI state from a list of position data dicts."""
-        old_atr_ratios_map = {sym: ratio for sym, ratio in zip(self.symbols, self.atr_ratios)}
-
-        self.all_positions_details.clear()
-        self.positions.clear()
-        self.atr_ratios.clear() # Will be repopulated
-        self.statuses.clear() # Will be repopulated
-        self.symbols.clear() # Will be repopulated
-        self.positions_held.clear()
-        self.current_prices.clear()
-        self.multipliers.clear()
-        self.computed_stop_losses.clear()
-
+    def update_raw_data_view(self):
+        """Updates the raw data text view based on the latest positions data."""
         display_text = ""
-        for p in positions_data:
-            self.all_positions_details.append(p)
-            self.positions.append(p['position'])
-            self.symbols.append(p['symbol'])
-            self.positions_held.append(p['positions_held'])
-            self.current_prices.append(p['current_price'])
-            self.multipliers.append(p.get('multiplier', 1.0))
-            self.contract_details_map[p['symbol']] = p['contract_details']
-
-            self.atr_ratios.append(old_atr_ratios_map.get(p['symbol'], 1.5))
-            self.statuses.append("Updating...")
-            self.computed_stop_losses.append(0) # Initialize with 0
+        for p in self.positions_data:
+            self.contract_details_map[p['symbol']] = p['contract_details'] # Keep this map updated
             raw_line = f"{p['symbol']} | Qty: {p['positions_held']} | Avg Cost: ${p['avg_cost']:.2f} | Price: ${p['current_price']:.2f} | P/L: ${p.get('unrealized_pl', 0):.2f} ({p.get('pl_percent', 0):.2f}%)"
             display_text += raw_line + "\n"
 
@@ -1383,20 +1063,21 @@ class ATRWindow(QMainWindow):
             symbol = result.get('symbol', 'Unknown')
             status = result.get('status', 'unknown')
             
-            if symbol in self.symbols:
-                idx = self.symbols.index(symbol)
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                message = result.get('message', 'Unknown')
+            # Find the corresponding position data and update its status
+            for p_data in self.positions_data:
+                if p_data['symbol'] == symbol:
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    message = result.get('message', 'Unknown')
 
-                if status in ['submitted', 'unchanged']:
-                    self.statuses[idx] = f"Order Updated - {timestamp}"
-                elif status == 'held':
-                    self.statuses[idx] = f"Held - {message}"
-                elif status == 'pending': # IBKR rejected or has non-final status
-                    self.statuses[idx] = f"Order Rejected - {message}"
-                elif status in ['error', 'skipped']:
-                    self.statuses[idx] = f"Error - {message}"
-        self.populate_positions_table()
+                    if status in ['submitted', 'unchanged']:
+                        p_data['status'] = f"Order Updated - {timestamp}"
+                    elif status == 'held':
+                        p_data['status'] = f"Held - {message}"
+                    elif status == 'pending':
+                        p_data['status'] = f"Order Rejected - {message}"
+                    elif status in ['error', 'skipped']:
+                        p_data['status'] = f"Error - {message}"
+                    break
 
     def on_adaptive_stop_toggled(self, state):
         """Handles the state change of the adaptive stop loss toggle switch."""

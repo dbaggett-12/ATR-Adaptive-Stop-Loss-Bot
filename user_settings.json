@@ -1,8 +1,8 @@
 {
   "symbol_stop_enabled": {
-    "MZL": true,
-    "MNQ": true,
+    "MZL": false,
+    "MNQ": false,
     "VEQT": false,
-    "MZW": true
+    "MZW": false
   }
 }

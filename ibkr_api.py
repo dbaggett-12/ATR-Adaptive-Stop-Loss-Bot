@@ -177,7 +177,7 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                     # --- This is an existing order, handle modification ---
                     existing_order = existing_trade.order
                     # Compare rounded prices to avoid floating point issues
-                    if round(existing_order.stopPrice, 2) == round(stop_price, 2):
+                    if math.isclose(existing_order.stopPrice, stop_price, rel_tol=1e-9, abs_tol=1e-9):
                         print(f"No change needed for {symbol}: Stop price is already {stop_price:.2f}")
                         results.append({'symbol': symbol, 'status': 'unchanged', 'message': 'Stop price is already correct.'})
                         continue
@@ -187,7 +187,7 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                         stop_order = StopOrder(
                             action=action,
                             totalQuantity=order_quantity,
-                            stopPrice=round(stop_price, 2), # Explicitly round to 2 decimal places
+                            stopPrice=stop_price, # Price is pre-rounded by calculator
                             orderId=existing_order.orderId, # IMPORTANT: Use existing orderId
                             tif='GTC'
                         )
@@ -199,7 +199,7 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                     stop_order = StopOrder(
                         action=action,
                         totalQuantity=order_quantity,
-                        stopPrice=round(stop_price, 2), # Explicitly round to 2 decimal places
+                        stopPrice=stop_price, # Price is pre-rounded by calculator
                         tif='GTC'
                     )
                     trade = await ib.placeOrderAsync(contract, stop_order)
