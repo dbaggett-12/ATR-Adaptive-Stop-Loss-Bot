@@ -410,14 +410,14 @@ class ATRWindow(QMainWindow):
         self.positions_data = [] # Store latest enriched position data for order submission
         self.contract_details_map = {}  # Store contract details by symbol
         self.symbol_stop_enabled = {}  # {symbol: bool} to track individual stop toggles
-        
+
         # ATR calculation data
         self.atr_symbols = []
         self.tr_values = []
         self.atr_calculated = []
         self.previous_atr_values = []
         self.previous_atr_sources = []  # Track if value is "Calculated" or "User Inputted"
-        
+
         # Track last market data values for each symbol to detect market closures
         self.last_market_data = {}  # {symbol: {'high': float, 'low': float, 'prev_close': float}}
         
@@ -426,7 +426,11 @@ class ATRWindow(QMainWindow):
         
         # Load ATR history
         self.atr_history, self.user_overrides = self.load_atr_history()
-        
+
+        # --- New: User Settings File and Loading ---
+        self.user_settings_file = os.path.join(os.path.dirname(__file__), 'user_settings.json')
+        self.symbol_stop_enabled = self.load_user_settings()
+
         # Adaptive Stop Loss toggle state
         self.send_adaptive_stops = False
         self.market_statuses = {}  # {symbol: 'OPEN' | 'CLOSED' | 'UNKNOWN'}
@@ -580,7 +584,9 @@ class ATRWindow(QMainWindow):
             if not self.thread.wait(5000):  # Wait up to 5 seconds for the thread to finish
                 logging.warning("Worker thread did not terminate gracefully. Forcing termination.")
                 self.thread.terminate() # As a last resort
-        
+
+        self.save_user_settings() # Save checkbox states on exit
+
         event.accept() # Proceed with closing the window
 
     def calculate_tr_and_atr(self, df, prior_atr, symbol=None):
@@ -770,6 +776,31 @@ class ATRWindow(QMainWindow):
                 error_item.setForeground(QtGui.QColor('red'))
                 self.table.setItem(i, 1, QTableWidgetItem(symbol))
                 self.table.setItem(i, 9, error_item)
+
+    def load_user_settings(self):
+        """Load user settings from user_settings.json"""
+        if os.path.exists(self.user_settings_file):
+            try:
+                with open(self.user_settings_file, 'r') as f:
+                    settings = json.load(f)
+                    # The file should contain the symbol_stop_enabled dictionary
+                    return settings.get('symbol_stop_enabled', {})
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Error loading user settings: {e}")
+                return {}
+        return {}
+
+    def save_user_settings(self):
+        """Save user settings to user_settings.json"""
+        try:
+            with open(self.user_settings_file, 'w') as f:
+                settings_to_save = {
+                    'symbol_stop_enabled': self.symbol_stop_enabled
+                }
+                json.dump(settings_to_save, f, indent=2)
+            logging.info("User settings saved successfully")
+        except Exception as e:
+            print(f"Error saving user settings: {e}")
 
     def on_symbol_toggle_changed(self, symbol, state):
         """Handles when a user toggles the checkbox for an individual symbol."""
