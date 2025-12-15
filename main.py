@@ -78,13 +78,13 @@ CONTRACT_POINT_VALUES = {
     # Metals
     'GC': 100.0,     # Gold: 100 oz × $1.00 = $100 per point
     'SI': 5000.0,    # Silver: 5000 oz × $1.00 = $5000 per point
-    'HG': 250.0,     # Copper: 25000 lbs × $0.01 = $250 per 1 cent (prices in cents/lb)
+    'HG': 25000.0,   # Copper: 25000 lbs. Price is in cents, so a 1.00 move (1 cent) is 25000 * $0.01 = $250.
     'PL': 50.0,      # Platinum: 50 oz × $1.00 = $50 per point
     
     # Micro Metals
     'MGC': 10.0,     # Micro Gold: 10 oz × $1.00 = $10 per point
     'SIL': 1000.0,   # Micro Silver: 1000 oz × $1.00 = $1000 per point
-    'MHG': 25.0,     # Micro Copper: 2500 lbs × $0.01 = $25 per 1 cent (1/10th of HG)
+    'MHG': 2500.0,   # Micro Copper: 2500 lbs. Price is in cents, so a 1.00 move (1 cent) is 2500 * $0.01 = $25.
     
     # Energy
     'CL': 1000.0,    # Crude Oil: 1000 barrels × $1.00 = $1000 per point
@@ -131,9 +131,16 @@ def get_point_value(symbol, contract_details, multiplier):
     price_magnifier = contract_details.get('priceMagnifier', 1)
     md_size_multiplier = contract_details.get('mdSizeMultiplier')
     
-    # Case 1: Agricultural contracts (quoted in cents)
-    # priceMagnifier > 1 indicates price is in smaller units (e.g., cents)
+    # Case 1: Contracts quoted in cents (e.g., agricultural, some metals)
+    # For these, the priceMagnifier is often > 1 (e.g., 100).
+    # The mdSizeMultiplier usually represents the contract size (e.g., 5000 bushels for ZC).
+    # The point value per 1-cent move is (mdSizeMultiplier * $0.01).
+    # Since a 1.00 price move *is* a 1-cent move, we need to divide by the magnifier
+    # to get the value per dollar, then multiply by the contract size.
+    # Simplified: point_value = mdSizeMultiplier / priceMagnifier
     if price_magnifier > 1 and md_size_multiplier is not None:
+        # For contracts like ZC (Corn): 5000 / 100 = $50 per 1-cent move.
+        # For HG (Copper): 25000 / 100 = $250 per 1-cent move.
         point_value = float(md_size_multiplier) / price_magnifier
         logging.warning(f"Unknown contract {symbol}. Derived point value: ${point_value:.2f} "
                        f"(mdSizeMultiplier={md_size_multiplier}, priceMagnifier={price_magnifier}). "
@@ -511,15 +518,15 @@ class ATRWindow(QMainWindow):
         self.tabs.addTab(self.positions_tab, "Positions")
 
         self.table = QTableWidget()
-        self.table.setColumnCount(11)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
-            "Send", "Position", "ATR", "ATR Ratio", "Positions Held",
-            "Current Price", "Computed Stop Loss", "MinTick", "$ Risk", "% Risk", "Status"
+            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", "Current Price",
+            "Computed Stop Loss", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.setColumnWidth(0, 50) # "Send" column
-        self.table.setColumnWidth(10, 240) # "Status" column
+        self.table.setColumnWidth(9, 240) # "Status" column
         self.positions_layout.addWidget(self.table)
 
         # --- Raw Data Tab ---
@@ -720,13 +727,8 @@ class ATRWindow(QMainWindow):
                 stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
                 self.table.setItem(i, 6, stop_item)
 
-                # Column 7: MinTick
+                # Column 7: $ Risk (MinTick column was removed)
                 contract_details = p_data.get('contract_details', {})
-                min_tick = contract_details.get('minTick', 'N/A')
-                min_tick_item = QTableWidgetItem(str(min_tick))
-                self.table.setItem(i, 7, min_tick_item)
-
-                # Column 8: $ Risk
                 risk_value = 0
                 if computed_stop and p_data['current_price'] > 0:
                     risk_in_points = p_data['current_price'] - computed_stop
@@ -742,9 +744,9 @@ class ATRWindow(QMainWindow):
                     # Total Risk = (Absolute Price Difference) * (Point Value) * (Quantity)
                     risk_value = risk_in_points * point_value * abs(p_data['positions_held'])
                 risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
-                self.table.setItem(i, 8, risk_item)
+                self.table.setItem(i, 7, risk_item)
 
-                # Column 9: % Risk
+                # Column 8: % Risk
                 hypothetical_account_value = 6000.0
                 percent_risk = 0.0
                 if hypothetical_account_value > 0:
@@ -755,11 +757,11 @@ class ATRWindow(QMainWindow):
                 if percent_risk > 2.0:
                     percent_risk_item.setForeground(QtGui.QColor('red'))
 
-                self.table.setItem(i, 9, percent_risk_item)
+                self.table.setItem(i, 8, percent_risk_item)
 
-                # Column 10: Status
+                # Column 9: Status
                 # Note: self.statuses[i] corresponds to the index of the symbol in self.symbols, not necessarily p_data
-                self.table.setItem(i, 10, QTableWidgetItem(self.statuses[i]))
+                self.table.setItem(i, 9, QTableWidgetItem(self.statuses[i]))
             except Exception as e:
                 symbol = p_data.get('symbol', 'UNKNOWN')
                 logging.error(f"Error populating table for symbol {symbol}: {e}")
@@ -767,7 +769,7 @@ class ATRWindow(QMainWindow):
                 error_item = QTableWidgetItem(f"Error: {e}")
                 error_item.setForeground(QtGui.QColor('red'))
                 self.table.setItem(i, 1, QTableWidgetItem(symbol))
-                self.table.setItem(i, 10, error_item)
+                self.table.setItem(i, 9, error_item)
 
     def on_symbol_toggle_changed(self, symbol, state):
         """Handles when a user toggles the checkbox for an individual symbol."""
