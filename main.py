@@ -28,6 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Constants ---
 ATR_HISTORY_FILE = 'atr_history.json'
+STOP_HISTORY_FILE = 'stop_history.json'
 
 
 class DataWorker(QObject):
@@ -41,12 +42,13 @@ class DataWorker(QObject):
     data_ready = pyqtSignal(list)
     orders_submitted = pyqtSignal(list)
     log_message = pyqtSignal(str) # Signal to send log messages to the UI
+    stops_updated = pyqtSignal(dict) # Signal to send back updated stops
     
     def __init__(self, atr_window, client_id):
         super().__init__()
         # Give worker access to the main window's methods and data
         self.atr_window = atr_window
-        self.send_adaptive_stops = atr_window.send_adaptive_stops
+        self.highest_stop_losses = atr_window.highest_stop_losses # Use a direct reference
         self.symbol_stop_enabled = atr_window.symbol_stop_enabled
         self.client_id = client_id # Use a consistent client ID
 
@@ -79,12 +81,15 @@ class DataWorker(QObject):
             calculator = PortfolioCalculator(
                 self.atr_window.atr_history.copy(),
                 self.atr_window.user_overrides.copy(),
-                self.atr_window.highest_stop_losses.copy(),
+                self.highest_stop_losses, # Pass the direct reference, not a copy
                 atr_ratios_map,
                 market_statuses
             )
             final_positions_data = calculator.process_positions(enriched_positions, atr_results)
             self.data_ready.emit(final_positions_data)
+            
+            # Emit the updated stops dictionary back to the main thread
+            self.stops_updated.emit(self.highest_stop_losses)
 
             # --- Stage 4: Submit Orders ---
             # Read the latest state of the toggle directly from the window
@@ -125,10 +130,6 @@ class DataWorker(QObject):
             symbol = p_data['symbol']
             final_stop_price = p_data.get('computed_stop_loss', 0)
 
-            # Get the highest stop loss recorded to check if we should hold.
-            # This is a safety check. The primary logic is now driven by the UI-calculated value.
-            highest_stop = self.atr_window.highest_stop_losses.get(symbol, 0)
-
             # Check if stop submission is enabled for this specific symbol
             if not self.symbol_stop_enabled.get(symbol, True):
                 logging.info(f"Worker: Skipping {symbol}: Stop submission is disabled for this symbol.")
@@ -148,18 +149,10 @@ class DataWorker(QObject):
                 })
                 continue
 
-            # Ratchet check: The calculator already applied this logic.
-            # We just need to check if the final stop price is the same as the held-over one.
-            is_long = p_data['positions_held'] > 0
-            held_stop = (is_long and final_stop_price < p_data['current_price'] and final_stop_price == highest_stop) or \
-                        (not is_long and final_stop_price > p_data['current_price'] and final_stop_price == highest_stop)
-
-            if held_stop and final_stop_price != 0:
-                logging.info(f"Worker: Holding stop for {symbol} at {final_stop_price:.4f}")
-                statuses_only.append({
-                    'symbol': symbol,
-                    'message': 'Stop Held'
-                })
+            # The calculator now determines the status. If it's 'held', we don't submit a new order.
+            # The 'computed_stop_loss' will be the held value, so the broker check will see no change.
+            if p_data.get('stop_status') == 'held':
+                logging.info(f"Worker: Stop for {symbol} is held. No new order will be submitted.")
                 continue
 
             orders_to_submit[symbol] = {
@@ -178,7 +171,6 @@ class ATRWindow(QMainWindow):
 
         # Data stores
         self.positions_data = [] # This will hold the fully processed data from the worker
-        self.highest_stop_losses = {}  # Track highest stop loss per symbol (never goes down)
         self.contract_details_map = {}  # Store contract details by symbol
         self.symbol_stop_enabled = {}  # {symbol: bool} to track individual stop toggles
         self.atr_ratios = {} # {symbol: float} to store user-set ATR ratios from the UI
@@ -193,6 +185,10 @@ class ATRWindow(QMainWindow):
         
         # Load ATR history
         self.atr_history, self.user_overrides = self.load_atr_history()
+
+        # Load persistent stop loss history
+        self.stop_history_file = os.path.join(os.path.dirname(__file__), STOP_HISTORY_FILE)
+        self.highest_stop_losses = self.load_stop_history() # This is now loaded from a file
 
         # --- New: User Settings File and Loading ---
         # Set a default client_id before loading settings
@@ -368,6 +364,7 @@ class ATRWindow(QMainWindow):
                 self.worker_thread.terminate()
 
         self.save_user_settings() # Save checkbox states on exit
+        self.save_stop_history() # Save stop history on exit
         event.accept() # Proceed with closing the window
 
     def populate_positions_table(self):
@@ -584,6 +581,29 @@ class ATRWindow(QMainWindow):
 
         # Reconnect the signal
         self.atr_table.cellChanged.connect(self.on_atr_changed)
+
+    def load_stop_history(self):
+        """Load the persistent stop loss history from stop_history.json."""
+        if os.path.exists(self.stop_history_file):
+            try:
+                with open(self.stop_history_file, 'r') as f:
+                    history = json.load(f)
+                    logging.info(f"Loaded {len(history)} symbols from stop history.")
+                    return history
+            except (json.JSONDecodeError, IOError) as e:
+                logging.error(f"Error loading stop history: {e}")
+                return {}
+        return {}
+
+    def save_stop_history(self):
+        """Save the current highest stop losses to stop_history.json."""
+        try:
+            with open(self.stop_history_file, 'w') as f:
+                json.dump(self.highest_stop_losses, f, indent=2)
+            logging.info("Stop history saved successfully.")
+        except Exception as e:
+            logging.error(f"Error saving stop history: {e}")
+
 
     def load_atr_history(self):
         """Load ATR history and user overrides from JSON file"""
@@ -963,6 +983,7 @@ class ATRWindow(QMainWindow):
         # Connect the new consolidated signal
         self.worker.data_ready.connect(self.handle_data_ready)
         self.worker.orders_submitted.connect(self.handle_orders_submitted)
+        self.worker.stops_updated.connect(self.handle_stops_updated)
 
         self.worker_thread.start()
         logging.info("Worker started for full refresh cycle.")
@@ -1008,6 +1029,13 @@ class ATRWindow(QMainWindow):
         self.update_raw_data_view()
         self.populate_atr_table()
         self.populate_positions_table()
+
+    def handle_stops_updated(self, updated_stops):
+        """Receives the updated stop dictionary from the worker and saves it."""
+        logging.info("Main thread received updated stop-loss dictionary from worker.")
+        self.highest_stop_losses = updated_stops
+        self.save_stop_history() # Persist the changes immediately
+
 
     def handle_orders_submitted(self, order_results):
         """Stage 4: Order submission is complete. Update statuses."""
