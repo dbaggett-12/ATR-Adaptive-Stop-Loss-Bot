@@ -195,8 +195,11 @@ class ATRWindow(QMainWindow):
         self.atr_history, self.user_overrides = self.load_atr_history()
 
         # --- New: User Settings File and Loading ---
+        # Set a default client_id before loading settings
+        self.client_id = 1000 
         self.user_settings_file = os.path.join(os.path.dirname(__file__), 'user_settings.json')
-        self.symbol_stop_enabled = self.load_user_settings()
+        # Load settings, which will update client_id if it exists in the file
+        self.load_user_settings()
 
         # Adaptive Stop Loss toggle state
         self.send_adaptive_stops = False
@@ -204,9 +207,6 @@ class ATRWindow(QMainWindow):
 
         # Threading
         self.worker_thread = None
-
-        # --- New: Stable Client ID ---
-        self.client_id = random.randint(100, 999) # Generate one ID at startup
 
         # Central widget & layout
         central_widget = QWidget()
@@ -220,22 +220,31 @@ class ATRWindow(QMainWindow):
         status_container.setLayout(status_layout)
         
         # Adaptive Stop Loss Toggle (Left side)
-        toggle_container = QWidget()
-        toggle_layout = QHBoxLayout()
-        toggle_container.setLayout(toggle_layout)
-        toggle_layout.setContentsMargins(0, 0, 0, 0)
-        
+        left_status_container = QWidget()
+        left_status_layout = QVBoxLayout()
+        left_status_container.setLayout(left_status_layout)
+        left_status_layout.setContentsMargins(0,0,0,0)
+
+        # -- Toggle Switch --
+        toggle_widget = QWidget()
+        toggle_hbox = QHBoxLayout(toggle_widget)
+        toggle_hbox.setContentsMargins(0,0,0,0)
         toggle_label = QLabel("Send Adaptive Stop Losses:")
         toggle_label.setStyleSheet("font-weight: bold;")
-        toggle_layout.addWidget(toggle_label)
-        
+        toggle_hbox.addWidget(toggle_label)
         self.adaptive_stop_toggle = QCheckBox()
         self.adaptive_stop_toggle.setChecked(False)
         self.adaptive_stop_toggle.stateChanged.connect(self.on_adaptive_stop_toggled)
         self.adaptive_stop_toggle.setText("OFF")
-        toggle_layout.addWidget(self.adaptive_stop_toggle)
-        
-        status_layout.addWidget(toggle_container)
+        toggle_hbox.addWidget(self.adaptive_stop_toggle)
+        left_status_layout.addWidget(toggle_widget)
+
+        # -- Client ID Display --
+        client_id_label = QLabel(f"Client ID: {self.client_id}") # This will now show the loaded/default ID
+        client_id_label.setStyleSheet("font-size: 10pt; color: grey;")
+        left_status_layout.addWidget(client_id_label)
+
+        status_layout.addWidget(left_status_container)
         
         # Add stretch to push GIF to the center
         status_layout.addStretch()
@@ -502,19 +511,24 @@ class ATRWindow(QMainWindow):
             try:
                 with open(self.user_settings_file, 'r') as f:
                     settings = json.load(f)
-                    # The file should contain the symbol_stop_enabled dictionary
-                    return settings.get('symbol_stop_enabled', {})
+                    # Load client_id, defaulting to the pre-set value if not in file
+                    self.client_id = settings.get('client_id', self.client_id)
+                    # Load symbol toggles
+                    self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Error loading user settings: {e}")
-                return {}
-        return {}
+                self.symbol_stop_enabled = {}
+        else:
+            self.symbol_stop_enabled = {}
 
     def save_user_settings(self):
-        """Save user settings to user_settings.json"""
+        """Save all user settings to user_settings.json"""
         try:
             with open(self.user_settings_file, 'w') as f:
                 settings_to_save = {
-                    'symbol_stop_enabled': self.symbol_stop_enabled
+                    'client_id': self.client_id,
+                    'symbol_stop_enabled': self.symbol_stop_enabled,
+                    # Add any other settings here in the future
                 }
                 json.dump(settings_to_save, f, indent=2)
             logging.info("User settings saved successfully")
