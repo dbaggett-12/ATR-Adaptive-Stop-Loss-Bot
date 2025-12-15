@@ -60,12 +60,14 @@ class PortfolioCalculator:
 
     def compute_stop_loss(self, position_data, current_price, atr_value, atr_ratio, apply_ratchet=True):
         """
-        Compute stop loss, applying rounding and ratcheting logic.
+        Compute stop loss, applying rounding and ratcheting logic. 
+        Returns a tuple of (final_stop, status) where status is 'new' or 'held'.
         """
         symbol = position_data['symbol']
 
+        # If no valid data, return the last known highest stop, and status 'held'
         if atr_value is None or current_price <= 0:
-            return self.highest_stop_losses.get(symbol, 0)
+            return self.highest_stop_losses.get(symbol, 0), 'held'
 
         raw_stop = current_price - (atr_value * atr_ratio)
 
@@ -88,6 +90,7 @@ class PortfolioCalculator:
             logging.debug(f"Rounding for {symbol}: raw={raw_stop}, minTick={min_tick}, final={final_stop}")
 
         prev_highest = self.highest_stop_losses.get(symbol, 0)
+        status = 'new' # Default to new
 
         if apply_ratchet:
             # For long positions, stop should only go up. For short, only down.
@@ -97,9 +100,9 @@ class PortfolioCalculator:
                 # New stop must be higher than previous highest
                 if final_stop > prev_highest:
                     self.highest_stop_losses[symbol] = final_stop
-                    return final_stop
+                    return final_stop, 'new'
                 else:
-                    return prev_highest
+                    return prev_highest, 'held'
             else: # is_short
                 # For shorts, a "higher" stop is a lower price.
                 # A new stop is an improvement if it's lower than the previous.
@@ -107,11 +110,12 @@ class PortfolioCalculator:
                 prev_highest_short = self.highest_stop_losses.get(symbol, float('inf'))
                 if final_stop < prev_highest_short:
                     self.highest_stop_losses[symbol] = final_stop
-                    return final_stop
+                    return final_stop, 'new'
                 else:
-                    return prev_highest_short
+                    return prev_highest_short, 'held'
         else:
-            return final_stop
+            # If not ratcheting, it's always considered 'new' for UI feedback purposes
+            return final_stop, 'new'
 
     def calculate_risk(self, position_data, computed_stop):
         """Calculates the dollar and percentage risk for a position."""
@@ -152,16 +156,18 @@ class PortfolioCalculator:
             atr_ratio = self.atr_ratios.get(symbol, 1.5)
 
             # --- Stop Loss Calculation ---
-            computed_stop = self.compute_stop_loss(
+            computed_stop, stop_status = self.compute_stop_loss(
                 p_data, p_data['current_price'], atr_value, atr_ratio
             )
 
             # --- Risk Calculation ---
             risk_value, percent_risk = self.calculate_risk(p_data, computed_stop)
+
             # --- Assemble final object for UI ---
             p_data['atr_value'] = atr_value
             p_data['atr_ratio'] = atr_ratio
             p_data['computed_stop_loss'] = computed_stop
+            p_data['stop_status'] = stop_status # Add the new status field
             p_data['dollar_risk'] = risk_value
             p_data['percent_risk'] = percent_risk
             p_data['status'] = "Ready" # Default status
