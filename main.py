@@ -175,6 +175,7 @@ class DataWorker(QObject):
         self.send_adaptive_stops = atr_window.send_adaptive_stops
         self.atr_ratios = atr_ratios
         self.highest_stop_losses = highest_stop_losses
+        self.symbol_stop_enabled = atr_window.symbol_stop_enabled
 
     async def run_async(self):
         """Main worker method, executes all data stages sequentially."""
@@ -342,6 +343,16 @@ class DataWorker(QObject):
             # This is a safety check. The primary logic is now driven by the UI-calculated value.
             highest_stop = self.atr_window.highest_stop_losses.get(symbol, 0)
 
+            # Check if stop submission is enabled for this specific symbol
+            if not self.symbol_stop_enabled.get(symbol, True):
+                logging.info(f"Worker: Skipping {symbol}: Stop submission is disabled for this symbol.")
+                statuses_only.append({
+                    'symbol': symbol,
+                    'status': 'skipped',
+                    'message': 'Individually disabled'
+                })
+                continue
+
 
             if final_stop_price <= 0:
                 logging.info(f"Worker: Skipping {symbol}: No valid stop price computed.")
@@ -391,6 +402,7 @@ class ATRWindow(QMainWindow):
         self.thread = None # Initialize thread attribute to None
         self.positions_data = [] # Store latest enriched position data for order submission
         self.contract_details_map = {}  # Store contract details by symbol
+        self.symbol_stop_enabled = {}  # {symbol: bool} to track individual stop toggles
         
         # ATR calculation data
         self.atr_symbols = []
@@ -499,15 +511,15 @@ class ATRWindow(QMainWindow):
         self.tabs.addTab(self.positions_tab, "Positions")
 
         self.table = QTableWidget()
-        self.table.setColumnCount(10)
+        self.table.setColumnCount(11)
         self.table.setHorizontalHeaderLabels([
-            "Position", "ATR", "ATR Ratio", "Positions Held",
+            "Send", "Position", "ATR", "ATR Ratio", "Positions Held",
             "Current Price", "Computed Stop Loss", "MinTick", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setSectionsMovable(True)
-        # Make the "Status" column (index 6) wider to accommodate text
-        self.table.setColumnWidth(9, 240)
+        self.table.setColumnWidth(0, 50) # "Send" column
+        self.table.setColumnWidth(10, 240) # "Status" column
         self.positions_layout.addWidget(self.table)
 
         # --- Raw Data Tab ---
@@ -646,8 +658,20 @@ class ATRWindow(QMainWindow):
                 symbol = p_data['symbol']
                 
                 # Column 0: Position
-                position_item = QTableWidgetItem(pos)
+                # Column 0: "Send Stop" Checkbox
+                checkbox_widget = QWidget()
+                checkbox_layout = QHBoxLayout(checkbox_widget)
+                checkbox = QCheckBox()
+                checkbox.setChecked(self.symbol_stop_enabled.get(symbol, True))
+                checkbox.stateChanged.connect(lambda state, s=symbol: self.on_symbol_toggle_changed(s, state))
+                checkbox_layout.addWidget(checkbox)
+                checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                checkbox_layout.setContentsMargins(0,0,0,0)
+                self.table.setCellWidget(i, 0, checkbox_widget)
+
+                # Column 1: Position
                 market_status = self.market_statuses.get(symbol, 'UNKNOWN')
+                position_item = QTableWidgetItem(pos)
 
                 # Create a colored circle icon
                 pixmap = QtGui.QPixmap(16, 16)
@@ -660,9 +684,9 @@ class ATRWindow(QMainWindow):
                 
                 icon = QtGui.QIcon(pixmap)
                 position_item.setIcon(icon)
-                self.table.setItem(i, 0, position_item)
+                self.table.setItem(i, 1, position_item)
                 
-                # Column 1: ATR - Get ATR value from ATR calculations tab
+                # Column 2: ATR - Get ATR value from ATR calculations tab
                 atr_value = None
                 atr_display = "N/A"
                 if symbol in self.atr_symbols: # Use the full precision ATR value for calculation
@@ -670,9 +694,9 @@ class ATRWindow(QMainWindow):
                     if self.atr_calculated[atr_index] is not None:
                         atr_value = self.atr_calculated[atr_index]
                         atr_display = f"{atr_value:.4f}" # Display with more precision
-                self.table.setItem(i, 1, QTableWidgetItem(atr_display))
+                self.table.setItem(i, 2, QTableWidgetItem(atr_display))
 
-                # Column 2: ATR Ratio editable spin box
+                # Column 3: ATR Ratio editable spin box
                 spin = QDoubleSpinBox()
                 spin.setMinimum(0.1)
                 spin.setMaximum(10.0)
@@ -681,28 +705,28 @@ class ATRWindow(QMainWindow):
                 spin.setValue(self.atr_ratios[i])
                 spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
                 spin.valueChanged.connect(lambda val, row=i: self.update_atr_ratio(row, val))
-                self.table.setCellWidget(i, 2, spin)
+                self.table.setCellWidget(i, 3, spin)
 
-                # Column 3: Positions Held
-                self.table.setItem(i, 3, QTableWidgetItem(str(p_data['positions_held'])))
+                # Column 4: Positions Held
+                self.table.setItem(i, 4, QTableWidgetItem(str(p_data['positions_held'])))
                 
-                # Column 4: Current Price
-                self.table.setItem(i, 4, QTableWidgetItem(f"{p_data['current_price']:.2f}"))
+                # Column 5: Current Price
+                self.table.setItem(i, 5, QTableWidgetItem(f"{p_data['current_price']:.2f}"))
 
-                # Column 5: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
+                # Column 6: Computed Stop Loss = Current Price - (ATR × ATR Ratio)
                 # Stop loss never goes down - use highest computed value
                 computed_stop = self.compute_stop_loss(p_data, p_data['current_price'], atr_value, self.atr_ratios[i])
                 self.computed_stop_losses[i] = computed_stop # Store the final computed stop
                 stop_item = QTableWidgetItem(f"{computed_stop:.2f}" if computed_stop else "N/A")
-                self.table.setItem(i, 5, stop_item)
+                self.table.setItem(i, 6, stop_item)
 
-                # Column 6: MinTick
+                # Column 7: MinTick
                 contract_details = p_data.get('contract_details', {})
                 min_tick = contract_details.get('minTick', 'N/A')
                 min_tick_item = QTableWidgetItem(str(min_tick))
-                self.table.setItem(i, 6, min_tick_item)
+                self.table.setItem(i, 7, min_tick_item)
 
-                # Column 7: $ Risk
+                # Column 8: $ Risk
                 risk_value = 0
                 if computed_stop and p_data['current_price'] > 0:
                     risk_in_points = p_data['current_price'] - computed_stop
@@ -718,9 +742,9 @@ class ATRWindow(QMainWindow):
                     # Total Risk = (Absolute Price Difference) * (Point Value) * (Quantity)
                     risk_value = risk_in_points * point_value * abs(p_data['positions_held'])
                 risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
-                self.table.setItem(i, 7, risk_item)
+                self.table.setItem(i, 8, risk_item)
 
-                # Column 8: % Risk
+                # Column 9: % Risk
                 hypothetical_account_value = 6000.0
                 percent_risk = 0.0
                 if hypothetical_account_value > 0:
@@ -731,19 +755,25 @@ class ATRWindow(QMainWindow):
                 if percent_risk > 2.0:
                     percent_risk_item.setForeground(QtGui.QColor('red'))
 
-                self.table.setItem(i, 8, percent_risk_item)
+                self.table.setItem(i, 9, percent_risk_item)
 
-                # Column 9: Status
+                # Column 10: Status
                 # Note: self.statuses[i] corresponds to the index of the symbol in self.symbols, not necessarily p_data
-                self.table.setItem(i, 9, QTableWidgetItem(self.statuses[i]))
+                self.table.setItem(i, 10, QTableWidgetItem(self.statuses[i]))
             except Exception as e:
                 symbol = p_data.get('symbol', 'UNKNOWN')
                 logging.error(f"Error populating table for symbol {symbol}: {e}")
                 # Optionally, display an error in the row
                 error_item = QTableWidgetItem(f"Error: {e}")
                 error_item.setForeground(QtGui.QColor('red'))
-                self.table.setItem(i, 0, QTableWidgetItem(symbol))
-                self.table.setItem(i, 9, error_item)
+                self.table.setItem(i, 1, QTableWidgetItem(symbol))
+                self.table.setItem(i, 10, error_item)
+
+    def on_symbol_toggle_changed(self, symbol, state):
+        """Handles when a user toggles the checkbox for an individual symbol."""
+        is_enabled = state == Qt.CheckState.Checked.value
+        self.symbol_stop_enabled[symbol] = is_enabled
+        logging.info(f"Stop loss submission for {symbol} set to: {'ENABLED' if is_enabled else 'DISABLED'}")
 
     def compute_stop_loss(self, position_data, current_price, atr_value, atr_ratio, apply_ratchet=True):
         """
@@ -1197,7 +1227,7 @@ class ATRWindow(QMainWindow):
             return
 
         self.thread = QThread()
-        self.worker = DataWorker(self, self.atr_ratios, self.highest_stop_losses)
+        self.worker = DataWorker(self, self.atr_ratios, self.highest_stop_losses) # self.symbol_stop_enabled is now passed via `self`
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -1328,7 +1358,7 @@ class ATRWindow(QMainWindow):
                 if status in ['submitted', 'unchanged']:
                     self.statuses[idx] = f"Order Updated - {timestamp}"
                 elif status == 'held':
-                    self.statuses[idx] = f"Order Held - {message}"
+                    self.statuses[idx] = f"Held - {message}"
                 elif status == 'pending': # IBKR rejected or has non-final status
                     self.statuses[idx] = f"Order Rejected - {message}"
                 elif status in ['error', 'skipped']:
