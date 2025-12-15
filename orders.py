@@ -42,15 +42,17 @@ async def _submit_or_modify_single_order(
         contract = Contract(conId=con_id)
         await ib.qualifyContractsAsync(contract)
 
-        # 2. Refresh open orders to get a live snapshot before acting.
+        # 2. Get all open trades from the live state.
         # This is done inside the task to avoid race conditions with other concurrent tasks.
-        open_trades = ib.openTrades() # Use openTrades() to get Trade objects with .contract and .order
+        # ib.openTrades() contains all live trades after reqAllOpenOrdersAsync() is called.
+        open_trades = ib.openTrades()
         logging.debug(f"Found {len(open_trades)} live trades to check against for {symbol}.")
 
         # 3. Look for existing stop
         existing_trade: Trade | None = None
         for trade in open_trades:
-            if trade.order.orderRef == order_ref and trade.contract.conId == con_id:
+            # Filter by orderRef (deterministic) and order type.
+            if trade.order.orderRef == order_ref and trade.order.orderType == 'STP':
                 existing_trade = trade
                 logging.info(f"Found existing stop for {symbol} with OrderId {trade.order.orderId}")
                 break
@@ -73,11 +75,13 @@ async def _submit_or_modify_single_order(
             # Poll until cancellation confirmed
             for _ in range(20):  # 2 seconds max
                 await asyncio.sleep(0.1)
+                # Poll the status from the trade object's orderStatus.
                 if existing_trade.orderStatus.status == 'Cancelled':
                     logging.info(f"Cancellation confirmed for OrderId {existing_order.orderId}")
                     break
             else:
                 logging.warning(f"Timeout waiting for cancellation of OrderId {existing_order.orderId}")
+                # Continue anyway, as the order is likely being cancelled.
 
         # 5. Place new stop order
         logging.info(f"Placing new {action} stop for {symbol}: {total_quantity} @ {stop_price:.4f}")
