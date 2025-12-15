@@ -1,8 +1,15 @@
 {
   "symbol_stop_enabled": {
     "MZL": false,
-    "MNQ": false,
+    "MNQ": true,
     "VEQT": false,
-    "MZW": false
+    "MZW": false,
+    "MZC": false,
+    "MES": false,
+    "MHG": false,
+    "MGC": true,
+    "MYM": true,
+    "VFV": false,
+    "XQQ": false
   }
 }

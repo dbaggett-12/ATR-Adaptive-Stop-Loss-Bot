@@ -175,23 +175,18 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
 
                 if existing_trade:
                     # --- This is an existing order, handle modification ---
-                    existing_order = existing_trade.order
                     # Compare rounded prices to avoid floating point issues
-                    if math.isclose(existing_order.stopPrice, stop_price, rel_tol=1e-9, abs_tol=1e-9):
+                    if math.isclose(existing_trade.order.stopPrice, stop_price, rel_tol=1e-9, abs_tol=1e-9):
                         print(f"No change needed for {symbol}: Stop price is already {stop_price:.2f}")
                         results.append({'symbol': symbol, 'status': 'unchanged', 'message': 'Stop price is already correct.'})
                         continue
                     else:
-                        # To safely modify, create a new order object with the existing order's ID
-                        print(f"Modifying {symbol} stop order from {existing_order.stopPrice} to {stop_price:.2f}")
-                        stop_order = StopOrder(
-                            action=action,
-                            totalQuantity=order_quantity,
-                            stopPrice=stop_price, # Price is pre-rounded by calculator
-                            orderId=existing_order.orderId, # IMPORTANT: Use existing orderId
-                            tif='GTC'
-                        )
-                        trade = await ib.placeOrderAsync(contract, stop_order)
+                        # To modify, we must update the existing order object in-place.
+                        print(f"Modifying {symbol} stop order from {existing_trade.order.stopPrice} to {stop_price:.2f}")
+                        existing_order = existing_trade.order # Get the live order object
+                        existing_order.action = action
+                        existing_order.stopPrice = stop_price
+                        trade = ib.placeOrder(contract, existing_order)
                         trades_to_monitor.append(trade)
                 else:
                     # --- This is a new order, create it ---
@@ -200,9 +195,10 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                         action=action,
                         totalQuantity=order_quantity,
                         stopPrice=stop_price, # Price is pre-rounded by calculator
-                        tif='GTC'
+                        tif='GTC',
+                        orderId=ib.client.getReqId() # Get a new unique ID for a new order
                     )
-                    trade = await ib.placeOrderAsync(contract, stop_order)
+                    trade = ib.placeOrder(contract, stop_order)
                     trades_to_monitor.append(trade)
 
             except Exception as e:

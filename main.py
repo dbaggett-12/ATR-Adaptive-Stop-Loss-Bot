@@ -17,6 +17,7 @@ from ibkr_api import get_market_statuses_for_all, fetch_basic_positions, fetch_m
 from ib_insync import IB, util, Future, Contract, StopOrder
 import math
 import asyncio
+from orders import process_stop_orders
 import struct
 from decimal import Decimal, ROUND_DOWN
 
@@ -41,19 +42,19 @@ class DataWorker(QObject):
     orders_submitted = pyqtSignal(list)
     log_message = pyqtSignal(str) # Signal to send log messages to the UI
     
-    def __init__(self, atr_window):
+    def __init__(self, atr_window, client_id):
         super().__init__()
         # Give worker access to the main window's methods and data
         self.atr_window = atr_window
         self.send_adaptive_stops = atr_window.send_adaptive_stops
         self.symbol_stop_enabled = atr_window.symbol_stop_enabled
+        self.client_id = client_id # Use a consistent client ID
 
     async def run_async(self):
         """Main worker method, executes all data stages sequentially."""
         ib = IB()
         try:
-            client_id = random.randint(100, 999)
-            await ib.connectAsync('127.0.0.1', 7497, clientId=client_id)
+            await ib.connectAsync('127.0.0.1', 7497, clientId=self.client_id)
             
             # --- Stage 1: Fetch Positions ---
             # Using reqPositionsAsync for non-blocking behavior
@@ -97,30 +98,12 @@ class DataWorker(QObject):
             final_results = stop_loss_data.get('statuses_only', [])
             orders_to_submit = stop_loss_data.get('orders_to_submit', {})
             
-            # Get all open trades to check for existing stop orders
-            open_trades = await ib.reqAllOpenOrdersAsync()
-            existing_stop_orders = {}
-            for trade in open_trades:
-                if trade.order.orderType == 'STP':
-                    # Use conId for a more reliable key than symbol
-                    existing_stop_orders[trade.contract.conId] = trade
-
             if orders_to_submit:
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                self.log_message.emit(f"--- [{timestamp}] Submitting Orders ---")
-                for symbol, data in orders_to_submit.items():
-                    stop_price = data['stop_price']
-                    self.log_message.emit(f"  {symbol}: Stop Price = {stop_price:.4f} (Raw: 0x{struct.pack('>d', stop_price).hex()})")
-
-                # Submit all orders concurrently using asyncio.gather
-                tasks = [self.submit_or_modify_order(ib, symbol, data, existing_stop_orders) for symbol, data in orders_to_submit.items()]
-                submission_results = await asyncio.gather(*tasks)
-
+                # Use the new centralized order processing function
+                submission_results = await process_stop_orders(ib, orders_to_submit, self.log_message)
                 final_results.extend(submission_results)
-                self.orders_submitted.emit(final_results)
-            else:
-                logging.info("No new stop loss orders to submit.")
-                self.orders_submitted.emit(final_results)
+            
+            self.orders_submitted.emit(final_results)
 
         except Exception as e:
             self.error.emit(str(e))
@@ -132,79 +115,6 @@ class DataWorker(QObject):
     def run(self):
         """Synchronous entry point that runs the async run_async method."""
         asyncio.run(self.run_async())
-
-    async def submit_or_modify_order(self, ib, symbol, order_data, existing_stop_orders):
-        """Submits a new stop loss order or modifies an existing one."""
-        contract_details = order_data['contract_details']
-        quantity = order_data['quantity']
-        stop_price = order_data['stop_price']
-        con_id = contract_details.get('conId')
-
-        try:
-            # Recreate the contract object for placing the order
-            contract = Contract(
-                conId=contract_details['conId'],
-                exchange=contract_details.get('exchange', '')
-            )
-            await ib.qualifyContractsAsync(contract)
-
-            # Determine order action based on position quantity
-            action = 'SELL' if quantity > 0 else 'BUY'
-            total_quantity = abs(quantity)
-
-            existing_trade = existing_stop_orders.get(con_id)
-
-            if existing_trade:
-                # --- MODIFY EXISTING ORDER ---
-                existing_order = existing_trade.order
-                # Compare rounded prices to avoid floating point issues
-                if round(existing_order.stopPrice, 4) == round(stop_price, 4):
-                    logging.info(f"No change needed for {symbol}: Stop price is already {stop_price:.4f}")
-                    return {'symbol': symbol, 'status': 'unchanged', 'message': f'Stop price is already {stop_price:.4f}'}
-                
-                logging.info(f"Modifying {symbol} stop order from {existing_order.stopPrice} to {stop_price:.4f}")
-                order = StopOrder(
-                    action=action,
-                    totalQuantity=total_quantity,
-                    stopPrice=stop_price,
-                    orderId=existing_order.orderId, # IMPORTANT: Use existing orderId to modify
-                    # transmit=False, # Optional: for manual submission flow
-                    tif='GTC'
-                )
-            else:
-                # --- CREATE NEW ORDER ---
-                logging.info(f"Creating new {action} STOP for {symbol}: {total_quantity} @ {stop_price:.4f}")
-                order = StopOrder(
-                    action=action,
-                    totalQuantity=total_quantity,
-                    stopPrice=stop_price,
-                    orderId=ib.client.getReqId(), # Explicitly get a new unique ID for a new order
-                    tif='GTC'  # Good-Til-Canceled
-                )
-
-            # placeOrder is synchronous and returns a Trade object immediately. It is not awaitable.
-            trade = ib.placeOrder(contract, order)
-            logging.info(f"Placed order for {symbol}. OrderId: {trade.order.orderId}. Waiting for status...")
-
-            # Wait for the order status to be updated.
-            # The 'update' event on the trade is fired when its state changes.
-            try:
-                await asyncio.wait_for(trade.statusEvent, timeout=10)  # Wait up to 10 seconds
-            except asyncio.TimeoutError:
-                logging.warning(f"Timeout waiting for order status update for {symbol}. Current status: {trade.orderStatus.status}")
-
-            final_status = trade.orderStatus.status
-            if final_status in {'Submitted', 'PreSubmitted', 'ApiPending', 'PendingSubmit'}:
-                logging.info(f"Successfully submitted stop loss for {symbol} at {stop_price}")
-                return {'symbol': symbol, 'status': 'submitted', 'message': f'Stop at {stop_price:.4f} ({final_status})'}
-            else:
-                logging.error(f"Order for {symbol} was not submitted successfully. Status: {trade.orderStatus.status}")
-                return {'symbol': symbol, 'status': 'error', 'message': f'Failed: {trade.orderStatus.status}'}
-
-        except Exception as e:
-            logging.error(f"Error processing stop loss for {symbol}: {e}")
-            return {'symbol': symbol, 'status': 'error', 'message': str(e)}
-
 
     def build_stop_loss_data(self, processed_positions):
         """Prepares the data structure for submitting stop loss orders."""
@@ -271,6 +181,7 @@ class ATRWindow(QMainWindow):
         self.highest_stop_losses = {}  # Track highest stop loss per symbol (never goes down)
         self.contract_details_map = {}  # Store contract details by symbol
         self.symbol_stop_enabled = {}  # {symbol: bool} to track individual stop toggles
+        self.atr_ratios = {} # {symbol: float} to store user-set ATR ratios from the UI
 
         # ATR calculation data
         self.atr_symbols = []
@@ -293,6 +204,9 @@ class ATRWindow(QMainWindow):
 
         # Threading
         self.worker_thread = None
+
+        # --- New: Stable Client ID ---
+        self.client_id = random.randint(100, 999) # Generate one ID at startup
 
         # Central widget & layout
         central_widget = QWidget()
@@ -494,7 +408,7 @@ class ATRWindow(QMainWindow):
                 spin.setDecimals(1)
                 spin.setValue(p_data.get('atr_ratio', 1.5))
                 spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-                spin.valueChanged.connect(lambda val, row=i: self.update_atr_ratio(row, val))
+                spin.valueChanged.connect(lambda val, row=i, symbol=symbol: self.on_atr_ratio_changed(row, symbol, val))
                 self.table.setCellWidget(i, 3, spin)
 
                 # Column 4: Positions Held
@@ -534,13 +448,53 @@ class ATRWindow(QMainWindow):
                 self.table.setItem(i, 1, QTableWidgetItem(symbol))
                 self.table.setItem(i, 9, error_item)
 
+    def on_atr_ratio_changed(self, row, symbol, value):
+        """
+        Slot for when a user changes the ATR ratio spinbox.
+        This method updates the internal state and triggers a recalculation.
+        It does NOT perform calculations itself.
+        """
+        # 1. Update the internal state for ATR ratios
+        self.atr_ratios[symbol] = value
+        logging.info(f"User set ATR Ratio for {symbol} to {value:.1f}. Triggering recalculation.")
+
+        # 2. Trigger the recalculation for the specific row
+        self.recalculate_row(row)
+
+    def recalculate_row(self, row):
+        """
+        Recalculates stop loss and risk for a single row using the PortfolioCalculator.
+        This is called after a user input (like ATR Ratio) changes.
+        """
+        if row >= len(self.positions_data):
+            return
+
+        p_data = self.positions_data[row]
+        symbol = p_data['symbol']
+
+        # Use a temporary calculator instance for this single operation
+        # It uses the application's current state
+        calculator = PortfolioCalculator(
+            self.atr_history, self.user_overrides, self.highest_stop_losses, self.atr_ratios, self.market_statuses
+        )
+
+        # Recalculate stop loss for this position, but WITHOUT applying the ratchet.
+        # This gives the user immediate feedback on the stop level for that ratio.
+        # The ratchet will apply on the next full refresh cycle.
+        new_stop = calculator.compute_stop_loss(p_data, p_data['current_price'], p_data.get('atr_value'), self.atr_ratios.get(symbol, 1.5), apply_ratchet=False)
+
+        # Recalculate risk based on the new un-ratcheted stop
+        new_risk_dollar, new_risk_percent = calculator.calculate_risk(p_data, new_stop)
+
+        # Update the UI with the new values
+        self.table.item(row, 6).setText(f"{new_stop:.4f}" if new_stop is not None else "N/A")
+        self.table.item(row, 7).setText(f"${new_risk_dollar:,.2f}")
+        self.table.item(row, 8).setText(f"{new_risk_percent:.2f}%")
+
     def get_atr_ratio_for_symbol(self, symbol):
         """Finds the ATR ratio for a symbol from the UI table."""
-        for i in range(self.table.rowCount()):
-            if self.table.item(i, 1) and self.table.item(i, 1).text() == symbol:
-                spin_box = self.table.cellWidget(i, 3)
-                return spin_box.value() if spin_box else 1.5
-        return 1.5 # Default
+        # Read from our internal state dictionary first, then fall back to the widget
+        return self.atr_ratios.get(symbol, 1.5)
 
     def load_user_settings(self):
         """Load user settings from user_settings.json"""
@@ -973,7 +927,7 @@ class ATRWindow(QMainWindow):
             return
 
         self.worker_thread = QThread()
-        self.worker = DataWorker(self)
+        self.worker = DataWorker(self, self.client_id) # Pass the stable client ID
         self.worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.worker.run)

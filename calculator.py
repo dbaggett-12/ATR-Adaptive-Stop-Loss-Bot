@@ -113,6 +113,29 @@ class PortfolioCalculator:
         else:
             return final_stop
 
+    def calculate_risk(self, position_data, computed_stop):
+        """Calculates the dollar and percentage risk for a position."""
+        risk_value = 0
+        percent_risk = 0.0
+        current_price = position_data.get('current_price', 0)
+
+        if computed_stop and current_price > 0:
+            risk_in_points = abs(current_price - computed_stop)
+            
+            point_value = get_point_value(
+                position_data['symbol'], 
+                position_data.get('contract_details', {}), 
+                position_data.get('multiplier', 1.0)
+            )
+            
+            risk_value = risk_in_points * point_value * abs(position_data['positions_held'])
+            
+            hypothetical_account_value = 6000.0 # This could be a configurable setting
+            if hypothetical_account_value > 0:
+                percent_risk = (risk_value / hypothetical_account_value) * 100
+        
+        return risk_value, percent_risk
+
     def process_positions(self, positions_data, atr_results):
         """
         Takes raw position and ATR data, returns a list of fully calculated position objects for the UI.
@@ -134,23 +157,7 @@ class PortfolioCalculator:
             )
 
             # --- Risk Calculation ---
-            risk_value = 0
-            percent_risk = 0.0
-            if computed_stop and p_data['current_price'] > 0:
-                risk_in_points = abs(p_data['current_price'] - computed_stop)
-                
-                point_value = get_point_value(
-                    symbol, 
-                    p_data.get('contract_details', {}), 
-                    p_data.get('multiplier', 1.0)
-                )
-                
-                risk_value = risk_in_points * point_value * abs(p_data['positions_held'])
-                
-                hypothetical_account_value = 6000.0 # This could be a configurable setting
-                if hypothetical_account_value > 0:
-                    percent_risk = (risk_value / hypothetical_account_value) * 100
-
+            risk_value, percent_risk = self.calculate_risk(p_data, computed_stop)
             # --- Assemble final object for UI ---
             p_data['atr_value'] = atr_value
             p_data['atr_ratio'] = atr_ratio
