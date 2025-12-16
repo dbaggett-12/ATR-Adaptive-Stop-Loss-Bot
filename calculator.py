@@ -10,27 +10,26 @@ class PortfolioCalculator:
     Handles all business logic and calculations for portfolio positions.
     This class is UI-agnostic and runs in the background.
     """
-    def __init__(self, atr_history, user_overrides, highest_stop_losses, atr_ratios, market_statuses):
+    def __init__(self, atr_history, user_overrides, highest_stop_losses, atr_ratios, market_statuses, log_callback=None):
         self.atr_history = atr_history
-        self.user_overrides = user_overrides
+        self.user_overrides = user_overrides # Kept for signature compatibility, but logic is removed.
         self.highest_stop_losses = highest_stop_losses
         self.atr_ratios = atr_ratios
         self.market_statuses = market_statuses
+        self.log_callback = log_callback or (lambda msg: logging.info(msg))
 
     def calculate_tr_and_atr(self, df, prior_atr, symbol=None):
         """
         Calculate True Range (TR) and Average True Range (ATR) for a given dataframe.
         """
         if len(df) < 2:
-            return None, None
+            return 0.0, None # Return 0.0 for TR if not enough data
 
         if symbol and self.market_statuses.get(symbol) == 'CLOSED':
-            logging.info(f"Market for {symbol} is CLOSED. Reusing previous ATR: {prior_atr:.4f}")
-            prev_close = df['close'].iloc[-2]
-            current_high = df['high'].iloc[-1]
-            current_low = df['low'].iloc[-1]
-            current_tr = max(current_high - current_low, abs(current_high - prev_close), abs(current_low - prev_close))
-            return current_tr, prior_atr
+            # If the market is closed, there is no new price action, so TR is 0.
+            # We can reuse the prior ATR.
+            logging.info(f"Market for {symbol} is CLOSED. TR is 0. Reusing previous ATR: {prior_atr}")
+            return 0.0, prior_atr
 
         prev_close = df['close'].iloc[-2]
         current_high = df['high'].iloc[-1]
@@ -166,6 +165,8 @@ class PortfolioCalculator:
             # --- Assemble final object for UI ---
             p_data['atr_value'] = atr_value
             p_data['atr_ratio'] = atr_ratio
+            p_data['previous_atr'] = atr_data.get('previous_atr')
+            p_data['tr'] = atr_data.get('tr')
             p_data['computed_stop_loss'] = computed_stop
             p_data['stop_status'] = stop_status # Add the new status field
             p_data['dollar_risk'] = risk_value
@@ -175,3 +176,10 @@ class PortfolioCalculator:
             processed_data.append(p_data)
 
         return processed_data
+
+    def save_atr_value(self, symbol, interval_key, atr_value):
+        """Saves a calculated ATR value directly into the history dictionary."""
+        if symbol not in self.atr_history:
+            self.atr_history[symbol] = {}
+        self.atr_history[symbol][interval_key] = atr_value
+        self.log_callback(f"Calculator: Staged ATR {atr_value:.4f} for {symbol} at {interval_key} for saving.")

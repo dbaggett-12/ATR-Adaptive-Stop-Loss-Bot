@@ -2,14 +2,14 @@
   "client_id": 1000,
   "symbol_stop_enabled": {
     "MZL": false,
-    "MNQ": true,
+    "MNQ": false,
     "VEQT": false,
     "MZW": false,
     "MZC": false,
-    "MES": true,
-    "MHG": true,
-    "MGC": true,
-    "MYM": true,
+    "MES": false,
+    "MHG": false,
+    "MGC": false,
+    "MYM": false,
     "VFV": false,
     "XQQ": false
   }
