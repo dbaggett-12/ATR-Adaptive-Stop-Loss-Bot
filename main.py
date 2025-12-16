@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timedelta
 from PyQt6 import QtGui, QtCore
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout, QDialog, QFormLayout, QLineEdit, QDialogButtonBox,
     QWidget, QDoubleSpinBox, QTabWidget, QTextEdit, QPushButton, QHeaderView, QAbstractSpinBox,
     QLabel, QHBoxLayout, QCheckBox, QStyle
 )
@@ -162,6 +162,29 @@ class DataWorker(QObject):
             }
         return {'orders_to_submit': orders_to_submit, 'statuses_only': statuses_only}
 
+class SettingsWindow(QDialog):
+    """A dialog window for application settings."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(300)
+
+        # Main layout
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        # Client ID setting
+        self.client_id_edit = QLineEdit(str(parent.client_id))
+        form_layout.addRow("Client ID:", self.client_id_edit)
+
+        layout.addLayout(form_layout)
+
+        # OK and Cancel buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
 class ATRWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -236,9 +259,10 @@ class ATRWindow(QMainWindow):
         left_status_layout.addWidget(toggle_widget)
 
         # -- Client ID Display --
-        client_id_label = QLabel(f"Client ID: {self.client_id}") # This will now show the loaded/default ID
-        client_id_label.setStyleSheet("font-size: 10pt; color: grey;")
-        left_status_layout.addWidget(client_id_label)
+        self.client_id_label = QLabel(f"Client ID: {self.client_id}") # This will now show the loaded/default ID
+        self.client_id_label.setObjectName("client_id_label") # Set object name for robustness
+        self.client_id_label.setStyleSheet("font-size: 10pt; color: grey;")
+        left_status_layout.addWidget(self.client_id_label)
 
         status_layout.addWidget(left_status_container)
         
@@ -276,6 +300,17 @@ class ATRWindow(QMainWindow):
         self.last_pull_time = QLabel("Never")
         status_layout.addWidget(self.last_pull_time)
         
+        # Add spacing before settings button
+        status_layout.addSpacing(20)
+
+        # --- Settings Button ---
+        self.settings_button = QPushButton()
+        # Use a standard icon that looks like a gear/settings
+        settings_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        self.settings_button.setIcon(settings_icon)
+        self.settings_button.clicked.connect(self.open_settings_window)
+        status_layout.addWidget(self.settings_button)
+
         layout.addWidget(status_container)
 
         # Tabs
@@ -345,6 +380,20 @@ class ATRWindow(QMainWindow):
         # Fetch data immediately on startup
         self.start_full_refresh()
 
+    def open_settings_window(self):
+        """Opens the settings dialog window."""
+        dialog = SettingsWindow(self)
+        if dialog.exec():  # This is a blocking call
+            try:
+                new_client_id = int(dialog.client_id_edit.text())
+                if self.client_id != new_client_id:
+                    self.client_id = new_client_id
+                    self.save_user_settings()
+                    self.log_to_ui(f"Client ID updated to {self.client_id}. Changes will apply on next refresh.")
+                    # Update the label in the main window
+                    self.client_id_label.setText(f"Client ID: {self.client_id}")
+            except ValueError:
+                self.log_to_ui("Invalid Client ID entered. It must be an integer.")
     def log_to_ui(self, message):
         """Appends a message to the log view and auto-scrolls to the bottom."""
         self.log_view.append(message)
@@ -498,13 +547,14 @@ class ATRWindow(QMainWindow):
         # Recalculate stop loss for this position, but WITHOUT applying the ratchet.
         # This gives the user immediate feedback on the stop level for that ratio.
         # The ratchet will apply on the next full refresh cycle.
-        new_stop = calculator.compute_stop_loss(p_data, p_data['current_price'], p_data.get('atr_value'), self.atr_ratios.get(symbol, 1.5), apply_ratchet=False)
+        # The function returns a tuple (stop_price, status), so we unpack it.
+        new_stop, _ = calculator.compute_stop_loss(p_data, p_data['current_price'], p_data.get('atr_value'), self.atr_ratios.get(symbol, 1.5), apply_ratchet=False)
 
         # Recalculate risk based on the new un-ratcheted stop
         new_risk_dollar, new_risk_percent = calculator.calculate_risk(p_data, new_stop)
 
         # Update the UI with the new values
-        self.table.item(row, 6).setText(f"{new_stop:.4f}" if new_stop is not None else "N/A")
+        self.table.item(row, 6).setText(f"{new_stop:.4f}" if new_stop is not None and isinstance(new_stop, (int, float)) else "N/A")
         self.table.item(row, 8).setText(f"${new_risk_dollar:,.2f}")
         self.table.item(row, 9).setText(f"{new_risk_percent:.2f}%")
 
@@ -548,6 +598,13 @@ class ATRWindow(QMainWindow):
         is_enabled = state == Qt.CheckState.Checked.value
         self.symbol_stop_enabled[symbol] = is_enabled
         logging.info(f"Stop loss submission for {symbol} set to: {'ENABLED' if is_enabled else 'DISABLED'}")
+
+        # If the user disables the symbol, reset its stop loss ratchet.
+        if not is_enabled and symbol in self.highest_stop_losses:
+            del self.highest_stop_losses[symbol]
+            self.save_stop_history() # Persist the change immediately
+            self.log_to_ui(f"Ratchet for {symbol} has been reset. Its stop loss history is cleared.")
+            logging.info(f"Removed {symbol} from highest_stop_losses to reset ratchet.")
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
