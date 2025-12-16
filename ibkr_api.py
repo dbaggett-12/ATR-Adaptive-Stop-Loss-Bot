@@ -353,10 +353,18 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
     if not positions:
         return results
 
-    contracts_to_qualify = [pos.contract for pos in positions]
+    # Filter out positions with zero quantity before doing any work
+    active_positions = [p for p in positions if p.position != 0]
+    if not active_positions:
+        logging.info("No active positions with non-zero quantity found.")
+        return results
+    
+    logging.info(f"Found {len(active_positions)} active positions out of {len(positions)} total.")
+
+    contracts_to_qualify = [pos.contract for pos in active_positions]
     await ib.qualifyContractsAsync(*contracts_to_qualify)
 
-    for pos in positions:
+    for pos in active_positions:
         positions_held = float(pos.position)
         raw_avg_cost = float(pos.avgCost)
         symbol = pos.contract.symbol

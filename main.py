@@ -344,16 +344,6 @@ class ATRWindow(QMainWindow):
         self.table.setColumnWidth(10, 180) # "Status" column
         self.positions_layout.addWidget(self.table)
 
-        # --- Raw Data Tab ---
-        self.raw_tab = QWidget()
-        self.raw_layout = QVBoxLayout()
-        self.raw_tab.setLayout(self.raw_layout)
-        self.tabs.addTab(self.raw_tab, "Raw Data")
-
-        self.raw_data_view = QTextEdit()
-        self.raw_data_view.setReadOnly(True)
-        self.raw_layout.addWidget(self.raw_data_view)
-
         # --- ATR Calculations Tab ---
         self.atr_calc_tab = QWidget()
         self.atr_calc_layout = QVBoxLayout()
@@ -1006,7 +996,6 @@ class ATRWindow(QMainWindow):
         """Handles the fully processed data from the worker."""
         logging.info(f"Data ready: Received {len(positions_data)} fully processed positions.")
         if not positions_data:
-            self.raw_data_view.setPlainText("No positions returned from IBKR")
             self.table.setRowCount(0)
             self.atr_table.setRowCount(0)
             return
@@ -1019,8 +1008,11 @@ class ATRWindow(QMainWindow):
         self.atr_calculated = [p.get('atr_value') for p in self.positions_data]
         self.previous_atr_values = [p.get('previous_atr') for p in self.positions_data] # Assuming this is added
 
+        # Update the contract details map, which was previously in update_raw_data_view
+        for p in self.positions_data:
+            self.contract_details_map[p['symbol']] = p['contract_details']
+
         # Update UI
-        self.update_raw_data_view()
         self.populate_atr_table()
         self.populate_positions_table()
         
@@ -1040,21 +1032,10 @@ class ATRWindow(QMainWindow):
         self.process_order_results(order_results)
         self.populate_positions_table() # Repopulate to show final statuses
 
-    def update_raw_data_view(self):
-        """Updates the raw data text view based on the latest positions data."""
-        display_text = ""
-        for p in self.positions_data:
-            self.contract_details_map[p['symbol']] = p['contract_details'] # Keep this map updated
-            raw_line = f"{p['symbol']} | Qty: {p['positions_held']} | Avg Cost: ${p['avg_cost']:.2f} | Price: ${p['current_price']:.2f} | P/L: ${p.get('unrealized_pl', 0):.2f} ({p.get('pl_percent', 0):.2f}%)"
-            display_text += raw_line + "\n"
-
-        self.raw_data_view.setPlainText(display_text)
-        self.populate_positions_table()
-
     def handle_data_error(self, error_message):
         """Slot to handle errors from the worker thread."""
         logging.error(f"Error in worker thread: {error_message}")
-        self.raw_data_view.setPlainText(f"Error fetching data: {error_message}")
+        self.log_to_ui(f"Error fetching data: {error_message}")
         self.update_status(False)
 
     def process_order_results(self, results):
