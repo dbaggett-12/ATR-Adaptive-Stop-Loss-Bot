@@ -1,6 +1,7 @@
 # main.py
 import sys
 import logging
+import threading
 import random
 import json
 import os
@@ -18,6 +19,7 @@ from ib_insync import IB, util, Future, Contract, StopOrder
 import math
 import asyncio
 from orders import process_stop_orders
+from atr_processor import ATRProcessor
 import struct
 from decimal import Decimal, ROUND_DOWN
 
@@ -39,7 +41,7 @@ class DataWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     # This single signal will carry all the calculated data for the UI
-    data_ready = pyqtSignal(list)
+    data_ready = pyqtSignal(list, dict) # Emits (final_positions_data, updated_atr_history)
     orders_submitted = pyqtSignal(list)
     log_message = pyqtSignal(str) # Signal to send log messages to the UI
     stops_updated = pyqtSignal(dict) # Signal to send back updated stops
@@ -72,8 +74,9 @@ class DataWorker(QObject):
             self.atr_window.market_statuses = market_statuses # Update main window
             
             symbols = [p['symbol'] for p in enriched_positions]
-            atr_results = await self.atr_window.calculate_atr_for_symbols(ib, symbols, market_statuses, contract_details_map, self.atr_window.atr_history)
-
+            # --- New ATR Calculation using ATRProcessor ---
+            atr_processor = ATRProcessor(self.atr_window.atr_history_file, self.atr_window.atr_file_lock)
+            atr_results, updated_atr_history = await atr_processor.run(ib, enriched_positions)
             # --- Instantiate and use the calculator ---
             # Pass copies of state to ensure thread safety
             atr_ratios_map = {p['symbol']: self.atr_window.get_atr_ratio_for_symbol(p['symbol']) for p in enriched_positions}
@@ -86,7 +89,7 @@ class DataWorker(QObject):
                 market_statuses
             )
             final_positions_data = calculator.process_positions(enriched_positions, atr_results)
-            self.data_ready.emit(final_positions_data)
+            self.data_ready.emit(final_positions_data, updated_atr_history)
             
             # Emit the updated stops dictionary back to the main thread
             self.stops_updated.emit(self.highest_stop_losses)
@@ -201,6 +204,7 @@ class ATRWindow(QMainWindow):
         self.atr_calculated = []
         self.previous_atr_values = []
         # ATR history file path
+        self.atr_file_lock = threading.Lock() # Lock for thread-safe file access
         self.atr_history_file = os.path.join(os.path.dirname(__file__), 'atr_history.json')
         
         # Load ATR history
@@ -852,96 +856,6 @@ class ATRWindow(QMainWindow):
                 # A more robust solution would use signals.
                 self.tr_values[row] = tr
 
-    async def calculate_atr_for_symbols(self, ib, symbols, market_statuses, contract_details_map, atr_history):
-        """Calculate ATR for each symbol in the list"""
-        # This function is now async and uses the provided 'ib' instance.
-        # It returns a list of dictionaries, one for each symbol.
-        results = [] # This will hold the calculated TR/ATR values to be returned
-        calculator = PortfolioCalculator(
-            self.atr_history, {}, self.highest_stop_losses, {}, market_statuses, self.log_to_ui
-        )
-
-        tasks = []
-        for symbol in symbols:
-            try:
-                previous_atr = None # This will be determined inside the loop
-                contract_info = contract_details_map.get(symbol, {})
-                if contract_info.get('conId'):
-                    # Use conId and exchange for most accurate contract identification
-                    contract = Contract(
-                        conId=contract_info['conId'],
-                        exchange=contract_info.get('exchange', '') # Explicitly add exchange
-                    )
-                    await ib.qualifyContractsAsync(contract)
-                    logging.info(f"Using conId {contract_info['conId']} and exchange '{contract.exchange}' for {symbol}")
-                elif contract_info.get('lastTradeDateOrContractMonth'):
-                    # Use actual expiration date from position
-                    contract = Future(
-                        symbol=symbol,
-                        lastTradeDateOrContractMonth=contract_info['lastTradeDateOrContractMonth'],
-                        exchange=contract_info.get('exchange', 'CME'),
-                        currency=contract_info.get('currency', 'USD')
-                    )
-                    await ib.qualifyContractsAsync(contract)
-                    print(f"Using expiration {contract_info['lastTradeDateOrContractMonth']} for {symbol}")
-                else:
-                    # Fallback - skip if we don't have contract details
-                    print(f"No contract details available for {symbol}, skipping ATR calculation")
-                    continue
-                
-                # Get historical bars (1 day of 15-minute candles for ATR calculation)
-                bars = await ib.reqHistoricalDataAsync(
-                    contract,
-                    endDateTime='',
-                    durationStr='1 D',
-                    barSizeSetting='15 mins',
-                    whatToShow='TRADES',
-                    useRTH=True,
-                    formatDate=1,
-                    keepUpToDate=False
-                )
-                
-                if not bars or len(bars) < 2:
-                    print(f"Not enough historical data for {symbol}")
-                    continue
-                
-                df = util.df(bars)
-                
-                if df is None or df.empty:
-                    continue
-
-                # The last bar in the data is the most recently closed 15-min candle.
-                # We calculate ATR for that completed interval and save it under that interval's key.
-                last_bar_time = bars[-1].date
-                completed_interval_key = self.get_15min_interval_key(last_bar_time) # e.g., "2023-10-26 14:30"
-
-                previous_atr = self.get_previous_atr(symbol, completed_interval_key)
-
-                current_tr, current_atr = None, None
-                
-                # Always calculate TR and ATR. The calculator will handle cases where previous_atr is None.
-                current_tr, current_atr = calculator.calculate_tr_and_atr(df, previous_atr, symbol)
-
-                if current_atr is not None:
-                    logging.info(f"Calculated ATR for {symbol} at completed interval {completed_interval_key}: {current_atr:.4f} (Prev ATR: {previous_atr}, TR: {current_tr})")
-                    calculator.save_atr_value(symbol, completed_interval_key, current_atr)
-                else:
-                    logging.warning(f"Could not calculate ATR for {symbol} at {completed_interval_key}. Previous ATR might be missing.")
-
-                results.append({
-                    'symbol': symbol,
-                    'tr': current_tr,
-                    'atr': current_atr,
-                    'previous_atr': previous_atr
-                })
-            
-            except Exception as e:
-                print(f"Error calculating ATR for {symbol}: {e}")
-                continue
-        
-        self.cleanup_old_atr_data() # Clean up old data after a full run
-        return results
-
     def start_full_refresh(self):
         """Starts the first stage of the data loading sequence."""
         self.update_status(False) # Show as disconnected/refreshing
@@ -992,13 +906,17 @@ class ATRWindow(QMainWindow):
         self.worker.deleteLater()
         self.worker_thread = None
 
-    def handle_data_ready(self, positions_data):
+    def handle_data_ready(self, positions_data, updated_atr_history):
         """Handles the fully processed data from the worker."""
         logging.info(f"Data ready: Received {len(positions_data)} fully processed positions.")
         if not positions_data:
             self.table.setRowCount(0)
             self.atr_table.setRowCount(0)
             return
+
+        # --- CRITICAL: Update the main window's history state from the worker ---
+        self.atr_history = updated_atr_history
+        logging.info(f"Main window ATR history updated with {len(self.atr_history)} symbols.")
 
         self.positions_data = positions_data
 
@@ -1015,9 +933,6 @@ class ATRWindow(QMainWindow):
         # Update UI
         self.populate_atr_table()
         self.populate_positions_table()
-        
-        # Save history after all UI updates are complete
-        self.save_atr_history()
 
     def handle_stops_updated(self, updated_stops):
         """Receives the updated stop dictionary from the worker and saves it."""
