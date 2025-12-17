@@ -8,13 +8,14 @@ import os
 from datetime import datetime, timedelta
 from PyQt6 import QtGui, QtCore
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout, QDialog, QFormLayout, QLineEdit, QDialogButtonBox,
+    QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout, QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QComboBox,
     QWidget, QDoubleSpinBox, QTabWidget, QTextEdit, QPushButton, QHeaderView, QAbstractSpinBox,
     QLabel, QHBoxLayout, QCheckBox, QStyle
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QMovie, QColor
 from ibkr_api import get_market_statuses_for_all, fetch_basic_positions, fetch_market_data_for_positions
+import pyqtgraph as pg
 from ib_insync import IB, util, Future, Contract, StopOrder
 import math
 import asyncio
@@ -369,6 +370,31 @@ class ATRWindow(QMainWindow):
         self.atr_table.verticalHeader().setDefaultSectionSize(60)  # Increase row height for multi-line text
         self.atr_calc_layout.addWidget(self.atr_table)
         self.atr_table.cellChanged.connect(self.on_atr_changed)
+
+        # --- Graphing Tab ---
+        self.graphing_tab = QWidget()
+        self.graphing_layout = QVBoxLayout()
+        self.graphing_tab.setLayout(self.graphing_layout)
+        self.tabs.addTab(self.graphing_tab, "Graphing")
+
+        # Controls for the graphing tab
+        graph_controls_widget = QWidget()
+        graph_controls_layout = QHBoxLayout(graph_controls_widget)
+        graph_controls_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.symbol_selector = QComboBox()
+        self.symbol_selector.setMinimumWidth(150)
+        self.symbol_selector.currentIndexChanged.connect(self.update_atr_graph)
+        graph_controls_layout.addWidget(QLabel("Symbol:"))
+        graph_controls_layout.addWidget(self.symbol_selector)
+        graph_controls_layout.addStretch() # Push controls to the left
+
+        self.graphing_layout.addWidget(graph_controls_widget)
+
+        # Plot widget
+        self.atr_plot = pg.PlotWidget()
+        self.graphing_layout.addWidget(self.atr_plot)
+
         # Setup auto-refresh timer (60 seconds = 60000 ms)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.start_full_refresh)
@@ -376,6 +402,54 @@ class ATRWindow(QMainWindow):
         
         # Fetch data immediately on startup
         self.start_full_refresh()
+
+    def populate_symbol_selector(self):
+        """Populates the symbol selector dropdown in the graphing tab."""
+        current_selection = self.symbol_selector.currentText()
+        self.symbol_selector.blockSignals(True)
+        self.symbol_selector.clear()
+        
+        symbols = sorted(self.atr_history.keys())
+        if not symbols:
+            self.symbol_selector.blockSignals(False)
+            return
+
+        self.symbol_selector.addItems(symbols)
+
+        # Restore previous selection if it still exists
+        if current_selection in symbols:
+            self.symbol_selector.setCurrentText(current_selection)
+        
+        self.symbol_selector.blockSignals(False)
+        # Manually trigger an update if the selection is valid
+        if self.symbol_selector.currentText():
+            self.update_atr_graph()
+
+    def update_atr_graph(self):
+        """Updates the ATR graph based on the selected symbol."""
+        symbol = self.symbol_selector.currentText()
+        self.atr_plot.clear()
+        self.atr_plot.setTitle(f"ATR History for {symbol}")
+        self.atr_plot.setLabel('left', 'ATR Value')
+        self.atr_plot.setLabel('bottom', 'Time')
+        self.atr_plot.showGrid(x=True, y=True)
+
+        if not symbol or symbol not in self.atr_history:
+            return
+
+        symbol_data = self.atr_history[symbol]
+        if not symbol_data:
+            return
+
+        # Sort data by timestamp and prepare for plotting
+        sorted_timestamps = sorted(symbol_data.keys())
+        x_data = [datetime.strptime(ts, '%Y-%m-%d %H:%M').timestamp() for ts in sorted_timestamps]
+        y_data = [symbol_data[ts] for ts in sorted_timestamps]
+
+        self.atr_plot.getAxis('bottom').setTickSpacing(3600, 1800) # Major tick every hour, minor every 30 mins
+        self.atr_plot.getAxis('bottom').setStyle(tickTextOffset = 10, autoExpandTextSpace=True)
+        self.atr_plot.setAxisItems({'bottom': pg.DateAxisItem()})
+        self.atr_plot.plot(x_data, y_data, pen=pg.mkPen('y', width=2), symbol='o', symbolBrush='y', symbolSize=5)
 
     def open_settings_window(self):
         """Opens the settings dialog window."""
@@ -941,6 +1015,7 @@ class ATRWindow(QMainWindow):
         # Update UI
         self.populate_atr_table()
         self.populate_positions_table()
+        self.populate_symbol_selector() # Populate the new dropdown
 
     def handle_stops_updated(self, updated_stops):
         """Receives the updated stop dictionary from the worker and saves it."""
