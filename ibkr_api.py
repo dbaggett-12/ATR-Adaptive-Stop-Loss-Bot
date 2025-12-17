@@ -269,79 +269,62 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
 
 async def get_market_statuses_for_all(ib: IB, contracts_info: dict) -> dict:
     """
-    Checks the market status for a batch of contracts in a single connection.
-    Each symbol is checked individually against its own trading hours and timezone.
+    Checks the market status for a batch of contracts using their explicit trading sessions.
+    Returns a detailed state: 'ACTIVE (RTH)', 'ACTIVE (NT)', or 'CLOSED'.
 
     Args:
         ib (IB): The connected ib_insync IB instance.
         contracts_info (dict): A dictionary mapping symbol to contract details dict.
 
     Returns:
-        dict: A dictionary mapping symbol to its market status ('OPEN', 'CLOSED', 'UNKNOWN').
+        dict: A dictionary mapping symbol to its detailed market status.
     """
-    statuses = {symbol: 'UNKNOWN' for symbol in contracts_info}
-    for symbol, details in contracts_info.items():
-            con_id = details.get('conId')
-            if not con_id:
-                logging.warning(f"No conId for {symbol}, skipping market status check")
-                continue
+    now_utc = datetime.now(pytz.utc)
 
-            try:
-                contract = Contract(conId=con_id)
-                cds = await ib.reqContractDetailsAsync(contract)
-                
-                if not cds:
-                    logging.warning(f"No contract details returned for {symbol} (conId: {con_id})")
-                    continue
+    async def check_status(symbol, details):
+        con_id = details.get('conId')
+        if not con_id:
+            logging.warning(f"No conId for {symbol}, skipping market status check.")
+            return symbol, 'CLOSED'
 
-                cd = cds[0]
-                
-                # Use the built-in liquidSessions() method which properly parses
-                # trading hours and handles timezones correctly for each contract
-                # liquidSessions returns sessions with timezone-aware datetimes
-                try:
-                    sessions = cd.liquidSessions()
-                except Exception as session_err:
-                    # Fallback to tradingSessions if liquidSessions fails
-                    logging.warning(f"liquidSessions failed for {symbol}, trying tradingSessions: {session_err}")
-                    try:
-                        sessions = cd.tradingSessions()
-                    except Exception as trading_err:
-                        logging.error(f"Both session methods failed for {symbol}: {trading_err}")
-                        continue
-                
-                if not sessions:
-                    # No sessions means market is closed or no trading hours defined
-                    logging.info(f"No trading sessions found for {symbol}, marking as CLOSED")
-                    statuses[symbol] = 'CLOSED'
-                    continue
-                
-                # Get the current time in UTC, which is what liquidSessions uses.
-                now_utc = datetime.now(pytz.utc)
-                time_zone_id = cd.timeZoneId
-                
-                is_open = False
-                for session in sessions:
-                    # session is a TradingSession namedtuple with start and end (timezone-aware datetimes)
-                    # These are already in UTC.
-                    session_start = session.start
-                    session_end = session.end
-                    
-                    # Compare the current UTC time with the session's UTC start and end times.
-                    if session_start <= now_utc < session_end:
-                        is_open = True
-                        logging.debug(
-                            f"{symbol}: Market OPEN. Current UTC time {now_utc.strftime('%H:%M:%S')} "
-                            f"is within session {session_start.strftime('%H:%M:%S')} - {session_end.strftime('%H:%M:%S')}"
-                        )
-                        break
-                
-                statuses[symbol] = 'OPEN' if is_open else 'CLOSED'
-                logging.info(f"Market status for {symbol}: {statuses[symbol]} (timezone: {time_zone_id})")
-                
-            except Exception as e:
-                logging.error(f"Error checking market status for {symbol}: {e}")
-    return statuses
+        try:
+            contract = Contract(conId=con_id)
+            cds = await ib.reqContractDetailsAsync(contract)
+            if not cds:
+                logging.warning(f"No contract details for {symbol}, marking as CLOSED.")
+                return symbol, 'CLOSED'
+
+            cd = cds[0]
+            # liquidSessions() returns timezone-aware UTC datetimes for Regular Trading Hours (RTH)
+            rth_sessions = cd.liquidSessions()
+            # tradingSessions() returns timezone-aware UTC datetimes for the full session (including overnight)
+            full_sessions = cd.tradingSessions()
+
+            # 1. Check for ACTIVE (RTH)
+            if rth_sessions:
+                for session in rth_sessions:
+                    if session.start <= now_utc < session.end:
+                        logging.info(f"Market status for {symbol}: ACTIVE (RTH)")
+                        return symbol, 'ACTIVE (RTH)'
+
+            # 2. Check for ACTIVE (NT) - Night Trading / Electronic Hours
+            if full_sessions:
+                for session in full_sessions:
+                    if session.start <= now_utc < session.end:
+                        logging.info(f"Market status for {symbol}: ACTIVE (NT)")
+                        return symbol, 'ACTIVE (NT)'
+
+        except Exception as e:
+            logging.error(f"Error checking market status for {symbol}: {e}")
+            return symbol, 'CLOSED'
+
+        # 3. If neither, it's CLOSED. This is the safe default.
+        logging.info(f"Market status for {symbol}: CLOSED (no active session found)")
+        return symbol, 'CLOSED'
+
+    tasks = [check_status(symbol, details) for symbol, details in contracts_info.items()]
+    results = await asyncio.gather(*tasks)
+    return dict(results)
 
 async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]:
     """

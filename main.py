@@ -98,10 +98,16 @@ class DataWorker(QObject):
             if self.atr_window.send_adaptive_stops:
                 logging.info("Adaptive stops are ENABLED. Proceeding with order submission logic.")
                 stop_loss_data = self.build_stop_loss_data(final_positions_data)
-                final_results = stop_loss_data.get('statuses_only', [])
-                orders_to_submit = stop_loss_data.get('orders_to_submit', {})
+                final_results = stop_loss_data.get('statuses_only', []) # Skipped/error statuses
+
+                # CRITICAL SAFETY CHECK: Only submit orders for symbols in RTH.
+                orders_to_submit = {
+                    symbol: data for symbol, data in stop_loss_data.get('orders_to_submit', {}).items()
+                    if market_statuses.get(symbol) == 'ACTIVE (RTH)'
+                }
                 
                 if orders_to_submit:
+                    logging.info(f"Submitting orders for {len(orders_to_submit)} symbols in RTH.")
                     submission_results = await process_stop_orders(ib, orders_to_submit, self.log_message)
                     final_results.extend(submission_results)
                 
@@ -223,7 +229,7 @@ class ATRWindow(QMainWindow):
 
         # Adaptive Stop Loss toggle state
         self.send_adaptive_stops = False
-        self.market_statuses = {}  # {symbol: 'OPEN' | 'CLOSED' | 'UNKNOWN'}
+        self.market_statuses = {}  # {symbol: 'ACTIVE (RTH)' | 'ACTIVE (NT)' | 'CLOSED'}
 
         # Threading
         self.worker_thread = None
@@ -425,14 +431,16 @@ class ATRWindow(QMainWindow):
                 checkbox_layout.setContentsMargins(0,0,0,0)
                 self.table.setCellWidget(i, 0, checkbox_widget)
 
-                # Column 1: Position
-                market_status = self.market_statuses.get(symbol, 'UNKNOWN') # From main window state
+                # Column 1: Position with new status indicator
+                market_status = self.market_statuses.get(symbol, 'CLOSED')
                 position_item = QTableWidgetItem(p_data['position'])
 
                 # Create a colored circle icon
                 pixmap = QtGui.QPixmap(16, 16)
-                if market_status == 'OPEN':
+                if market_status == 'ACTIVE (RTH)':
                     pixmap.fill(Qt.GlobalColor.green)
+                elif market_status == 'ACTIVE (NT)':
+                    pixmap.fill(QColor('orange')) # Orange for overnight/non-RTH
                 elif market_status == 'CLOSED':
                     pixmap.fill(Qt.GlobalColor.blue)
                 else:  # UNKNOWN or other

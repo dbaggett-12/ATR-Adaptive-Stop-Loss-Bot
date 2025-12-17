@@ -120,7 +120,7 @@ class ATRProcessor:
             # Fetch 1 day of 15-min bars. This is enough to get the last two candles.
             bars = await ib.reqHistoricalDataAsync(
                 contract, endDateTime='', durationStr='1 D', barSizeSetting='15 mins',
-                whatToShow='TRADES', useRTH=True, formatDate=1
+                whatToShow='TRADES', useRTH=False, formatDate=1
             )
 
             if not bars or len(bars) < 2:
