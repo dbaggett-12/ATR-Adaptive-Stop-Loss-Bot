@@ -47,30 +47,36 @@ class PortfolioCalculator:
             rounded_stop_decimal = (raw_stop_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=rounding_mode) * min_tick_decimal
             final_stop = float(rounded_stop_decimal)
             logging.debug(f"Rounding for {symbol}: raw={raw_stop}, minTick={min_tick}, final={final_stop}")
-
-        prev_highest = self.highest_stop_losses.get(symbol, 0)
-        status = 'new' # Default to new
-
+        
+        # Check if a ratchet value exists for this symbol.
+        # The presence of a key in highest_stop_losses indicates an active, tracked position.
+        is_new_position = symbol not in self.highest_stop_losses
+        
         if apply_ratchet:
-            # For long positions, stop should only go up. For short, only down.
-            is_long = quantity > 0
+            # If this is a brand new position, establish the first stop and treat it as 'new'.
+            if is_new_position:
+                self.highest_stop_losses[symbol] = final_stop
+                return final_stop, 'new'
             
+            # If it's an existing position, apply ratcheting logic.
+            is_long = quantity > 0
             if is_long:
+                prev_highest = self.highest_stop_losses.get(symbol, 0)
                 # New stop must be higher than previous highest
                 if final_stop > prev_highest:
                     self.highest_stop_losses[symbol] = final_stop
                     return final_stop, 'new'
                 else:
+                    # The calculated stop is not an improvement, so we hold the previous highest.
                     return prev_highest, 'held'
             else: # is_short
-                # For shorts, a "higher" stop is a lower price.
-                # A new stop is an improvement if it's lower than the previous.
-                # Initialize prev_highest to a very large number if not set for a short.
+                # For short positions, an "improving" stop is a lower price.
                 prev_highest_short = self.highest_stop_losses.get(symbol, float('inf'))
                 if final_stop < prev_highest_short:
                     self.highest_stop_losses[symbol] = final_stop
                     return final_stop, 'new'
                 else:
+                    # The calculated stop is not an improvement, so we hold the previous highest.
                     return prev_highest_short, 'held'
         else:
             # If not ratcheting, it's always considered 'new' for UI feedback purposes

@@ -19,7 +19,7 @@ import pyqtgraph as pg
 from ib_insync import IB, util, Future, Contract, StopOrder
 import math
 import asyncio
-from orders import process_stop_orders
+from orders import process_stop_orders, get_active_stop_symbols
 from atr_processor import ATRProcessor
 import struct
 from decimal import Decimal, ROUND_DOWN
@@ -64,6 +64,19 @@ class DataWorker(QObject):
             self.log_message.emit(f"Connecting in {self.atr_window.trading_mode} mode on port {port}...")
             await ib.connectAsync('127.0.0.1', port, clientId=self.client_id)
             
+            # --- CRITICAL RECONCILIATION STEP ---
+            # Before any calculations, get the ground truth of active stops from the brokerage.
+            active_stop_symbols = await get_active_stop_symbols(ib)
+            
+            # Reconcile the local stop history. Remove any symbol from our ratcheting
+            # history if it does NOT have an active stop order in the brokerage.
+            symbols_to_clear = set(self.highest_stop_losses.keys()) - active_stop_symbols
+            if symbols_to_clear:
+                self.log_message.emit(f"Reconciliation: Clearing stale ratchet history for: {', '.join(symbols_to_clear)}")
+                for symbol in symbols_to_clear:
+                    del self.highest_stop_losses[symbol]
+            # --- END RECONCILIATION ---
+
             # --- Stage 1: Fetch Positions ---
             # Using reqPositionsAsync for non-blocking behavior
             positions = await ib.reqPositionsAsync()

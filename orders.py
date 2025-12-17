@@ -16,6 +16,24 @@ def get_order_ref(symbol: str) -> str:
     # Create a simple, clean reference string for the order.
     return f"atr_stop_{symbol.lower().replace('.', '_')}"
 
+async def get_active_stop_symbols(ib: IB) -> set[str]:
+    """
+    Queries the brokerage for all open orders and returns a set of symbols
+    that have an active stop order managed by this application.
+    """
+    active_symbols = set()
+    try:
+        open_trades = await ib.reqAllOpenOrdersAsync()
+        logging.info(f"Reconciliation: Found {len(open_trades)} total open orders in brokerage.")
+        for trade in open_trades:
+            # Identify our managed stops by their unique orderRef and type
+            if trade.order.orderRef.startswith('atr_stop_') and trade.order.orderType == 'STP':
+                symbol = trade.contract.symbol
+                active_symbols.add(symbol)
+                logging.info(f"Reconciliation: Found active stop for {symbol}.")
+    except Exception as e:
+        logging.error(f"Reconciliation: Error fetching active stop symbols: {e}")
+    return active_symbols
 
 async def _submit_or_modify_single_order(
     ib: IB, symbol: str, order_data: dict
