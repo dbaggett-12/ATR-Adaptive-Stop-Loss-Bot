@@ -59,7 +59,10 @@ class DataWorker(QObject):
         """Main worker method, executes all data stages sequentially."""
         ib = IB()
         try:
-            await ib.connectAsync('127.0.0.1', 7497, clientId=self.client_id)
+            # Determine port based on trading mode
+            port = 7496 if self.atr_window.trading_mode == 'LIVE' else 7497
+            self.log_message.emit(f"Connecting in {self.atr_window.trading_mode} mode on port {port}...")
+            await ib.connectAsync('127.0.0.1', port, clientId=self.client_id)
             
             # --- Stage 1: Fetch Positions ---
             # Using reqPositionsAsync for non-blocking behavior
@@ -184,6 +187,12 @@ class SettingsWindow(QDialog):
         self.client_id_edit = QLineEdit(str(parent.client_id))
         form_layout.addRow("Client ID:", self.client_id_edit)
 
+        # Trading Mode setting
+        self.trading_mode_combo = QComboBox()
+        self.trading_mode_combo.addItems(["PAPER", "LIVE"])
+        self.trading_mode_combo.setCurrentText(parent.trading_mode)
+        form_layout.addRow("Trading Mode:", self.trading_mode_combo)
+
         layout.addLayout(form_layout)
 
         # OK and Cancel buttons
@@ -224,6 +233,7 @@ class ATRWindow(QMainWindow):
         # --- New: User Settings File and Loading ---
         # Set a default client_id before loading settings
         self.client_id = 1000 
+        self.trading_mode = "PAPER" # Default trading mode
         self.user_settings_file = os.path.join(os.path.dirname(__file__), 'user_settings.json')
         # Load settings, which will update client_id if it exists in the file
         self.load_user_settings()
@@ -271,6 +281,12 @@ class ATRWindow(QMainWindow):
         self.client_id_label.setObjectName("client_id_label") # Set object name for robustness
         self.client_id_label.setStyleSheet("font-size: 10pt; color: grey;")
         left_status_layout.addWidget(self.client_id_label)
+
+        # -- Trading Mode Display --
+        self.trading_mode_label = QLabel(f"Mode: {self.trading_mode}")
+        self.trading_mode_label.setObjectName("trading_mode_label")
+        self.trading_mode_label.setStyleSheet("font-size: 10pt; color: grey;")
+        left_status_layout.addWidget(self.trading_mode_label)
 
         status_layout.addWidget(left_status_container)
         
@@ -456,13 +472,21 @@ class ATRWindow(QMainWindow):
         dialog = SettingsWindow(self)
         if dialog.exec():  # This is a blocking call
             try:
+                # Update Client ID
                 new_client_id = int(dialog.client_id_edit.text())
                 if self.client_id != new_client_id:
                     self.client_id = new_client_id
-                    self.save_user_settings()
                     self.log_to_ui(f"Client ID updated to {self.client_id}. Changes will apply on next refresh.")
-                    # Update the label in the main window
                     self.client_id_label.setText(f"Client ID: {self.client_id}")
+
+                # Update Trading Mode
+                new_trading_mode = dialog.trading_mode_combo.currentText()
+                if self.trading_mode != new_trading_mode:
+                    self.trading_mode = new_trading_mode
+                    self.log_to_ui(f"Trading Mode set to {self.trading_mode}. Changes will apply on next refresh.")
+                    self.trading_mode_label.setText(f"Mode: {self.trading_mode}")
+
+                self.save_user_settings() # Save all settings at once
             except ValueError:
                 self.log_to_ui("Invalid Client ID entered. It must be an integer.")
     def log_to_ui(self, message):
@@ -644,6 +668,7 @@ class ATRWindow(QMainWindow):
                     settings = json.load(f)
                     # Load client_id, defaulting to the pre-set value if not in file
                     self.client_id = settings.get('client_id', self.client_id)
+                    self.trading_mode = settings.get('trading_mode', self.trading_mode)
                     # Load symbol toggles
                     self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
             except (json.JSONDecodeError, IOError) as e:
@@ -658,6 +683,7 @@ class ATRWindow(QMainWindow):
             with open(self.user_settings_file, 'w') as f:
                 settings_to_save = {
                     'client_id': self.client_id,
+                    'trading_mode': self.trading_mode,
                     'symbol_stop_enabled': self.symbol_stop_enabled,
                     # Add any other settings here in the future
                 }

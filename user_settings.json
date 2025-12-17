@@ -1,5 +1,6 @@
 {
   "client_id": 1000,
+  "trading_mode": "PAPER",
   "symbol_stop_enabled": {
     "MZL": false,
     "MNQ": false,
