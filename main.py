@@ -120,11 +120,11 @@ class DataWorker(QObject):
                 # CRITICAL SAFETY CHECK: Only submit orders for symbols in RTH.
                 orders_to_submit = {
                     symbol: data for symbol, data in stop_loss_data.get('orders_to_submit', {}).items()
-                    if market_statuses.get(symbol) == 'ACTIVE (RTH)'
+                    if market_statuses.get(symbol, '').startswith('ACTIVE')
                 }
                 
                 if orders_to_submit:
-                    logging.info(f"Submitting orders for {len(orders_to_submit)} symbols in RTH.")
+                    logging.info(f"Submitting orders for {len(orders_to_submit)} symbols in active sessions.")
                     submission_results = await process_stop_orders(ib, orders_to_submit, self.log_message)
                     final_results.extend(submission_results)
                 

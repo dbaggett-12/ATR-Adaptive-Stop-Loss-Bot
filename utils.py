@@ -67,6 +67,8 @@ CONTRACT_POINT_VALUES = {
     'HO': 420.0,     # Heating Oil: 42000 gallons × $0.01 = $420 per 1 cent
     
     # Micro Energy
+    'QM': 500.0,     # E-mini Crude Oil: 500 barrels x $1.00 = $500 per point
+    'QG': 2500.0,    # E-mini Natural Gas: 2500 MMBtu x $1.00 = $2500 per point
     'MCL': 100.0,    # Micro Crude Oil: 100 barrels × $1.00 = $100 per point
     'MNG': 1000.0,   # Micro Natural Gas: 1000 MMBtu × $1.00 = $1000 per point
     
