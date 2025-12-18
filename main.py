@@ -30,7 +30,8 @@ from utils import get_point_value # Import from the new utils file
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Constants ---
-ATR_HISTORY_FILE = 'atr_history.json'
+ATR_STATE_FILE = 'atr_state.json'
+ATR_HISTORY_FILE = 'atr_history.json' # For graphing
 STOP_HISTORY_FILE = 'stop_history.json'
 
 
@@ -42,7 +43,7 @@ class DataWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     # This single signal will carry all the calculated data for the UI
-    data_ready = pyqtSignal(list, dict) # Emits (final_positions_data, updated_atr_history)
+    data_ready = pyqtSignal(list, dict, dict) # Emits (final_positions_data, updated_atr_state, updated_atr_history)
     orders_submitted = pyqtSignal(list)
     log_message = pyqtSignal(str) # Signal to send log messages to the UI
     stops_updated = pyqtSignal(dict) # Signal to send back updated stops
@@ -92,21 +93,25 @@ class DataWorker(QObject):
             
             symbols = [p['symbol'] for p in enriched_positions]
             # --- New ATR Calculation using ATRProcessor ---
-            atr_processor = ATRProcessor(self.atr_window.atr_history_file, self.atr_window.atr_file_lock)
-            atr_results, updated_atr_history = await atr_processor.run(ib, enriched_positions)
+            atr_processor = ATRProcessor(
+                self.atr_window.atr_state_file, 
+                self.atr_window.atr_history_file, 
+                self.atr_window.atr_state_file_lock, 
+                self.atr_window.atr_history_file_lock)
+            atr_results, updated_atr_state, updated_atr_history = await atr_processor.run(ib, enriched_positions)
             # --- Instantiate and use the calculator ---
             # Pass copies of state to ensure thread safety
             atr_ratios_map = {p['symbol']: self.atr_window.get_atr_ratio_for_symbol(p['symbol']) for p in enriched_positions}
             
             calculator = PortfolioCalculator(
-                self.atr_window.atr_history, # Use direct reference, not a copy
+                self.atr_window.atr_state, # Use direct reference, not a copy
                 {}, # user_overrides is no longer used
                 self.highest_stop_losses, # Pass the direct reference, not a copy
                 atr_ratios_map,
                 market_statuses
             )
-            final_positions_data = calculator.process_positions(enriched_positions, atr_results)
-            self.data_ready.emit(final_positions_data, updated_atr_history)
+            final_positions_data = calculator.process_positions(enriched_positions, atr_results)            
+            self.data_ready.emit(final_positions_data, updated_atr_state, updated_atr_history)
             
             # Emit the updated stops dictionary back to the main thread
             self.stops_updated.emit(self.highest_stop_losses)
@@ -232,11 +237,13 @@ class ATRWindow(QMainWindow):
         self.tr_values = []
         self.atr_calculated = []
         self.previous_atr_values = []
-        # ATR history file path
-        self.atr_file_lock = threading.Lock() # Lock for thread-safe file access
-        self.atr_history_file = os.path.join(os.path.dirname(__file__), 'atr_history.json')
+        # State and History file paths and locks
+        self.atr_state_file_lock = threading.Lock()
+        self.atr_history_file_lock = threading.Lock()
+        self.atr_state_file = os.path.join(os.path.dirname(__file__), ATR_STATE_FILE)
+        self.atr_history_file = os.path.join(os.path.dirname(__file__), ATR_HISTORY_FILE)
         
-        # Load ATR history
+        self.atr_state = self.load_atr_state()
         self.atr_history = self.load_atr_history()
 
         # Load persistent stop loss history
@@ -466,13 +473,14 @@ class ATRWindow(QMainWindow):
         if not symbol or symbol not in self.atr_history:
             return
 
-        symbol_data = self.atr_history[symbol]
+        # Plot the ATR history, not the TR history from the state file.
+        symbol_data = self.atr_history.get(symbol, {})
         if not symbol_data:
             return
 
         # Sort data by timestamp and prepare for plotting
-        sorted_timestamps = sorted(symbol_data.keys())
-        x_data = [datetime.strptime(ts, '%Y-%m-%d %H:%M').timestamp() for ts in sorted_timestamps]
+        sorted_timestamps = sorted(symbol_data.keys()) # Timestamps are ISO strings
+        x_data = [datetime.fromisoformat(ts).timestamp() for ts in sorted_timestamps]
         y_data = [symbol_data[ts] for ts in sorted_timestamps]
 
         self.atr_plot.getAxis('bottom').setTickSpacing(3600, 1800) # Major tick every hour, minor every 30 mins
@@ -651,7 +659,7 @@ class ATRWindow(QMainWindow):
         # Use a temporary calculator instance for this single operation
         # It uses the application's current state
         calculator = PortfolioCalculator(
-            self.atr_history, {}, self.highest_stop_losses, self.atr_ratios, self.market_statuses
+            self.atr_state, {}, self.highest_stop_losses, self.atr_ratios, self.market_statuses
         )
 
         # Recalculate stop loss for this position, but WITHOUT applying the ratchet.
@@ -775,110 +783,47 @@ class ATRWindow(QMainWindow):
         except Exception as e:
             logging.error(f"Error saving stop history: {e}")
 
-
     def load_atr_history(self):
-        """Load ATR history and user overrides from JSON file"""
+        """Load ATR history for graphing from JSON file"""
         if os.path.exists(self.atr_history_file):
             try:
                 with open(self.atr_history_file, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                logging.error(f"Error loading ATR history: {e}")
+                return {}
+        return {}
+
+    def save_atr_history(self):
+        """Save ATR history for graphing to JSON file"""
+        with self.atr_history_file_lock:
+            try:
+                with open(self.atr_history_file, 'w') as f:
+                    json.dump(self.atr_history, f, indent=2)
+                logging.info("ATR history saved successfully.")
+            except Exception as e:
+                logging.error(f"Error saving ATR history: {e}")
+
+    def load_atr_state(self):
+        """Load ATR state (TR history and last ATR) from JSON file"""
+        if os.path.exists(self.atr_state_file):
+            try:
+                with open(self.atr_state_file, 'r') as f:
                     # The new format is just the history dictionary
                     return json.load(f)
             except (json.JSONDecodeError, IOError) as e:
-                print(f"Error loading ATR history: {e}")
+                print(f"Error loading ATR state: {e}")
                 return {}
         return {}
     
-    def save_atr_history(self):
-        """Save ATR history to JSON file"""
+    def save_atr_state(self):
+        """Save ATR state to JSON file"""
         try:
-            with open(self.atr_history_file, 'w') as f:
-                # Save only the atr_history dictionary
-                json.dump(self.atr_history, f, indent=2)
-            logging.info("ATR history saved successfully")
+            with open(self.atr_state_file, 'w') as f:
+                json.dump(self.atr_state, f, indent=2)
+            logging.info("ATR state saved successfully")
         except Exception as e:
-            print(f"Error saving ATR history: {e}")
-    
-    def get_previous_atr(self, symbol: str, before_key: str) -> float | None:
-        """
-        Gets the most recent ATR value for a symbol that occurred before the specified interval key.
-        This correctly handles gaps like weekends and overnight closures.
-
-        Args:
-            symbol: The symbol to look up.
-            before_key: The interval key (e.g., "2023-01-01 10:15") to search before.
-
-        Returns:
-            The most recent ATR value, or None if no prior history exists.
-        """
-        if symbol not in self.atr_history:
-            return None
-
-        # Get all timestamps for this symbol and sort them (most recent first)
-        timestamps = sorted(self.atr_history[symbol].keys(), reverse=True)
-
-        if not timestamps:
-            return None
-
-        # Find the most recent ATR value that is strictly before the 'before_key'
-        for timestamp in timestamps:
-            if timestamp < before_key:
-                return self.atr_history[symbol][timestamp]
-
-        return None
-    
-    def get_15min_interval_key(self, dt=None):
-        """Get the 15-minute interval key for a given datetime (or current time)"""
-        if dt is None:
-            dt = datetime.now()
-        
-        # Round down to nearest 15-minute interval
-        minute = (dt.minute // 15) * 15
-        interval_time = dt.replace(minute=minute, second=0, microsecond=0)
-        
-        # Format: YYYY-MM-DD HH:MM
-        return interval_time.strftime('%Y-%m-%d %H:%M')
-    
-    def cleanup_old_atr_data(self):
-        """Remove ATR data older than 7 days (1 week)"""
-        cutoff_time = datetime.now() - timedelta(days=7)
-        
-        symbols_to_remove = []
-        for symbol in self.atr_history:
-            timestamps_to_remove = []
-            for timestamp in self.atr_history[symbol]:
-                try:
-                    # Parse the timestamp
-                    timestamp_dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M')
-                    # If older than 24 hours, mark for removal
-                    if timestamp_dt < cutoff_time:
-                        timestamps_to_remove.append(timestamp)
-                except ValueError:
-                    # Handle old format (date only) - remove it
-                    try:
-                        timestamp_dt = datetime.strptime(timestamp, '%Y-%m-%d')
-                        if timestamp_dt < cutoff_time:
-                            timestamps_to_remove.append(timestamp)
-                    except ValueError:
-                        print(f"Invalid timestamp format: {timestamp}")
-                        timestamps_to_remove.append(timestamp)
-            
-            # Remove old timestamps
-            for timestamp in timestamps_to_remove:
-                del self.atr_history[symbol][timestamp]
-                logging.info(f"Removed old ATR data for {symbol} at {timestamp}")
-            
-            # If symbol has no more data, mark for removal
-            if not self.atr_history[symbol]:
-                symbols_to_remove.append(symbol)
-        
-        # Remove symbols with no data
-        for symbol in symbols_to_remove:
-            del self.atr_history[symbol]
-            logging.info(f"Removed symbol {symbol} (no data remaining)")
-        
-        # Save the cleaned history
-        if timestamps_to_remove or symbols_to_remove:
-            self.save_atr_history()
+            print(f"Error saving ATR state: {e}")
 
     def on_atr_changed(self, row, column):
         """Handle when a user manually edits the ATR value."""
@@ -894,21 +839,10 @@ class ATRWindow(QMainWindow):
                 # Update the internal data structure
                 self.atr_calculated[row] = new_atr_value
 
-                # Save the user-inputted value to history for the current interval
-                logging.info(f"User manually set ATR for {symbol} to {new_atr_value:.2f}")
-                
-                # Mark this interval as a user override
-                interval_key = self.get_15min_interval_key()
-                # Save the user-provided ATR value directly into the history for the current interval
-                if symbol not in self.atr_history:
-                    self.atr_history[symbol] = {}
-                self.atr_history[symbol][interval_key] = new_atr_value
-                self.save_atr_history()
-                logging.info(f"Saved user override for {symbol} at {interval_key}: {new_atr_value:.4f}")
-
-                # Repopulate the positions table to update computed stop loss
-                self.populate_positions_table()
-
+                # This functionality is now deprecated as ATR is derived from TR history.
+                # A user would need to edit the TR history to change the ATR.
+                # For now, we just log this action.
+                logging.warning(f"User manually edited ATR for {symbol} to {new_atr_value:.2f}. This is a display-only change and will be overwritten on the next refresh.")
             except ValueError:
                 logging.warning(f"Invalid input for ATR: '{item.text()}'. Please enter a number.")
                 # Optionally, revert to the old value or show an error
@@ -1026,9 +960,9 @@ class ATRWindow(QMainWindow):
         self.worker_thread.deleteLater()
         self.worker.deleteLater()
         self.worker_thread = None
-
-    def handle_data_ready(self, positions_data, updated_atr_history):
-        """Handles the fully processed data from the worker."""
+    
+    def handle_data_ready(self, positions_data, updated_atr_state, updated_atr_history):
+        """Handles the fully processed data from the worker. The 'atr_history' is now TR history."""
         logging.info(f"Data ready: Received {len(positions_data)} fully processed positions.")
         if not positions_data:
             self.table.setRowCount(0)
@@ -1036,7 +970,9 @@ class ATRWindow(QMainWindow):
             return
 
         # --- CRITICAL: Update the main window's history state from the worker ---
+        self.atr_state = updated_atr_state
         self.atr_history = updated_atr_history
+        logging.info(f"Main window ATR state updated with {len(self.atr_state)} symbols.")
         logging.info(f"Main window ATR history updated with {len(self.atr_history)} symbols.")
 
         self.positions_data = positions_data
@@ -1060,7 +996,7 @@ class ATRWindow(QMainWindow):
         """Receives the updated stop dictionary from the worker and saves it."""
         logging.info("Main thread received updated stop-loss dictionary from worker.")
         self.highest_stop_losses = updated_stops
-        self.save_stop_history() # Persist the changes immediately
+        self.save_stop_history() # Persist the changes
 
 
     def handle_orders_submitted(self, order_results):

@@ -10,7 +10,7 @@ class PortfolioCalculator:
     This class is UI-agnostic and runs in the background.
     """
     def __init__(self, atr_history, user_overrides, highest_stop_losses, atr_ratios, market_statuses, log_callback=None):
-        self.atr_history = atr_history
+        self.atr_state = atr_history # This is the full ATR state object.
         self.user_overrides = user_overrides # Kept for signature compatibility, but logic is removed.
         self.highest_stop_losses = highest_stop_losses
         self.atr_ratios = atr_ratios
