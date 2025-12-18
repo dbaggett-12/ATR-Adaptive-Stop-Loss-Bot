@@ -850,66 +850,9 @@ class ATRWindow(QMainWindow):
                     item.setText(f"{self.atr_calculated[row]:.2f}")
 
     def start_single_atr_recalc_worker(self, row, symbol, prior_atr):
-        """Starts a worker to recalculate ATR for a single symbol asynchronously."""
-        # We can reuse the DataWorker if we give it a specific task, or create a new one.
-        # For simplicity, let's create a small, dedicated async runner.
-        
-        async def task():
-            ib = IB()
-            try:
-                client_id = random.randint(100, 999)
-                await ib.connectAsync('127.0.0.1', 7497, clientId=client_id)
-                await self.recalculate_single_symbol_atr_async(ib, row, symbol, prior_atr)
-            except Exception as e:
-                logging.error(f"Error in single ATR recalc worker for {symbol}: {e}")
-            finally:
-                if ib.isConnected():
-                    ib.disconnect()
-
-        # We need a way to run this async task in a separate thread.
-        # The simplest way is to use a QThread and a QObject runner.
-        class Runner(QObject):
-            finished = pyqtSignal()
-            def run(self):
-                asyncio.run(task())
-                self.finished.emit()
-
-        self.recalc_thread = QThread()
-        self.recalc_runner = Runner()
-        self.recalc_runner.moveToThread(self.recalc_thread)
-        self.recalc_thread.started.connect(self.recalc_runner.run)
-        self.recalc_runner.finished.connect(self.recalc_thread.quit)
-        self.recalc_runner.finished.connect(self.recalc_runner.deleteLater)
-        self.recalc_thread.finished.connect(self.recalc_thread.deleteLater)
-        self.recalc_thread.start()
-
-    async def recalculate_single_symbol_atr_async(self, ib, row, symbol, prior_atr):
-        """Recalculates ATR for a single symbol asynchronously using a provided IB connection."""
-        contract_info = self.contract_details_map.get(symbol, {})
-        
-        if not contract_info.get('conId'):
-            logging.error(f"No conId available for {symbol} to recalculate ATR.")
-            return
-
-        contract = Contract(conId=contract_info['conId'], exchange=contract_info.get('exchange', ''))
-        await ib.qualifyContractsAsync(contract)
-        logging.info(f"Recalculating ATR for conId {contract.conId} on exchange '{contract.exchange}'")
-
-        bars = await ib.reqHistoricalDataAsync(
-            contract, endDateTime='', durationStr='1 D', barSizeSetting='15 mins',
-            whatToShow='TRADES', useRTH=True, formatDate=1
-        )
-        
-        if bars and len(bars) >= 2:
-            df = util.df(bars)
-            tr, atr = PortfolioCalculator(None, None, None, None, self.market_statuses).calculate_tr_and_atr(df, prior_atr=prior_atr, symbol=symbol)
-
-            if tr is not None and atr is not None:
-                # Since this runs in a background thread, we need to update UI elements
-                # safely. We can store the results and update the UI in the main thread,
-                # but for this direct update, let's assume it's safe enough for now.
-                # A more robust solution would use signals.
-                self.tr_values[row] = tr
+        """This function is deprecated and no longer used."""
+        logging.warning("start_single_atr_recalc_worker is deprecated and has been called. No action taken.")
+        pass
 
     def start_full_refresh(self):
         """Starts the first stage of the data loading sequence."""
