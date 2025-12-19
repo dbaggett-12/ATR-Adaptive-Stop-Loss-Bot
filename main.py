@@ -16,16 +16,12 @@ from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QMovie, QColor
 from ibkr_api import get_market_statuses_for_all, fetch_basic_positions, fetch_market_data_for_positions
 import pyqtgraph as pg
-from ib_insync import IB, util, Future, Contract, StopOrder
-import math
+from ib_insync import IB
 import asyncio
 from orders import process_stop_orders, get_active_stop_symbols
 from atr_processor import ATRProcessor
-import struct
-from decimal import Decimal, ROUND_DOWN
 
 from calculator import PortfolioCalculator
-from utils import get_point_value # Import from the new utils file
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -429,7 +425,6 @@ class ATRWindow(QMainWindow):
         self.atr_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.atr_table.verticalHeader().setDefaultSectionSize(60)  # Increase row height for multi-line text
         self.atr_calc_layout.addWidget(self.atr_table)
-        self.atr_table.cellChanged.connect(self.on_atr_changed)
 
         # --- Graphing Tab ---
         self.graphing_tab = QWidget()
@@ -797,9 +792,6 @@ class ATRWindow(QMainWindow):
 
     def populate_atr_table(self):
         """Populate the ATR Calculations table"""
-        # Temporarily disconnect the signal to prevent it from firing during population
-        self.atr_table.cellChanged.disconnect(self.on_atr_changed)
-
         self.atr_table.setRowCount(len(self.atr_symbols))
         for i in range(len(self.atr_symbols)):
             # Symbol (read-only)
@@ -825,10 +817,8 @@ class ATRWindow(QMainWindow):
 
             # ATR (editable)
             atr_item = QTableWidgetItem(f"{self.atr_calculated[i]:.2f}" if self.atr_calculated[i] is not None else "N/A")
+            atr_item.setFlags(atr_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.atr_table.setItem(i, 3, atr_item)
-
-        # Reconnect the signal
-        self.atr_table.cellChanged.connect(self.on_atr_changed)
 
     def load_stop_history(self):
         """Load the persistent stop loss history from stop_history.json."""
@@ -893,35 +883,6 @@ class ATRWindow(QMainWindow):
             logging.info("ATR state saved successfully")
         except Exception as e:
             print(f"Error saving ATR state: {e}")
-
-    def on_atr_changed(self, row, column):
-        """Handle when a user manually edits the ATR value."""
-        if column == 3:  # "ATR (14)" column
-            item = self.atr_table.item(row, column)
-            if not item:
-                return
-
-            try:
-                new_atr_value = float(item.text())
-                symbol = self.atr_table.item(row, 0).text()
-
-                # Update the internal data structure
-                self.atr_calculated[row] = new_atr_value
-
-                # This functionality is now deprecated as ATR is derived from TR history.
-                # A user would need to edit the TR history to change the ATR.
-                # For now, we just log this action.
-                logging.warning(f"User manually edited ATR for {symbol} to {new_atr_value:.2f}. This is a display-only change and will be overwritten on the next refresh.")
-            except ValueError:
-                logging.warning(f"Invalid input for ATR: '{item.text()}'. Please enter a number.")
-                # Optionally, revert to the old value or show an error
-                if self.atr_calculated[row] is not None:
-                    item.setText(f"{self.atr_calculated[row]:.2f}")
-
-    def start_single_atr_recalc_worker(self, row, symbol, prior_atr):
-        """This function is deprecated and no longer used."""
-        logging.warning("start_single_atr_recalc_worker is deprecated and has been called. No action taken.")
-        pass
 
     def start_full_refresh(self):
         """Starts the first stage of the data loading sequence."""
