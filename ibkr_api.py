@@ -1,4 +1,4 @@
-from ib_insync import IB, util, Contract, StopOrder
+from ib_insync import IB, util, Contract, StopOrder, Order
 from time import sleep
 import asyncio
 import random
@@ -282,19 +282,28 @@ async def get_market_statuses_for_all(ib: IB, contracts_info: dict) -> dict:
     now_utc = datetime.now(pytz.utc)
 
     async def check_status(symbol, details):
-        con_id = details.get('conId')
-        if not con_id:
-            logging.warning(f"No conId for {symbol}, skipping market status check.")
-            return symbol, 'CLOSED'
+        # Optimization: Use cached ContractDetails if available from fetch_market_data_for_positions
+        cd = details.get('ib_contract_details')
 
-        try:
-            contract = Contract(conId=con_id)
-            cds = await ib.reqContractDetailsAsync(contract)
-            if not cds:
-                logging.warning(f"No contract details for {symbol}, marking as CLOSED.")
+        if not cd:
+            con_id = details.get('conId')
+            if not con_id:
+                logging.warning(f"No conId for {symbol}, skipping market status check.")
                 return symbol, 'CLOSED'
 
-            cd = cds[0]
+            try:
+                # Include exchange for robustness
+                contract = Contract(conId=con_id, exchange=details.get('exchange', ''))
+                cds = await ib.reqContractDetailsAsync(contract)
+                if not cds:
+                    logging.warning(f"No contract details for {symbol}, marking as CLOSED.")
+                    return symbol, 'CLOSED'
+                cd = cds[0]
+            except Exception as e:
+                logging.error(f"Error checking market status for {symbol}: {e}")
+                return symbol, 'CLOSED'
+
+        try:
             # liquidSessions() returns timezone-aware UTC datetimes for Regular Trading Hours (RTH)
             rth_sessions = cd.liquidSessions()
             # tradingSessions() returns timezone-aware UTC datetimes for the full session (including overnight)
@@ -390,6 +399,7 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
             'market_value': 0.0,
             'unrealized_pl': 0.0,
             'pl_percent': 0.0,
+            'margin': 0.0,
         })
     return results
 
@@ -422,9 +432,45 @@ async def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) ->
         contract = Contract(conId=p['contract_details']['conId'], exchange=p['contract_details'].get('exchange', ''))
         tickers[p['symbol']] = ib.reqMktData(contract, "", False, False)
     
-    logging.info("Waiting for market data to populate...")
-    await asyncio.sleep(5)
-    logging.info("Finished waiting for market data.")
+    # --- Fetch Margin Requirements (Concurrent with Market Data Wait) ---
+    async def fetch_margin_safe(contract, order):
+        try:
+            order.whatIf = True
+            return await ib.whatIfOrderAsync(contract, order)
+        except Exception as e:
+            logging.debug(f"Margin fetch failed for {contract.symbol}: {e}")
+            return None
+
+    margin_tasks = []
+    for p in positions_data:
+        # Simulate closing the position to see margin release
+        action = 'SELL' if p['positions_held'] > 0 else 'BUY'
+        qty = abs(p['positions_held'])
+        contract = Contract(conId=p['contract_details']['conId'], exchange=p['contract_details'].get('exchange', ''))
+        order = Order(action=action, totalQuantity=qty, orderType='MKT', tif='DAY')
+        margin_tasks.append(fetch_margin_safe(contract, order))
+
+    logging.info("Waiting for market data to populate and fetching margins...")
+    
+    # Run sleep and margin fetch concurrently
+    # We wait at least 5 seconds for market data, and ensure margin tasks complete
+    results = await asyncio.gather(asyncio.sleep(5), asyncio.gather(*margin_tasks, return_exceptions=True))
+    margin_results = results[1]
+    
+    logging.info("Finished waiting for market data and margins.")
+
+    # Process margin results
+    for p_data, result in zip(positions_data, margin_results):
+        margin = 0.0
+        if result and not isinstance(result, Exception):
+            try:
+                # maintMarginChange is negative when closing releases margin
+                change = float(result.maintMarginChange)
+                if abs(change) < 1e308: # Check for valid value (not max double)
+                    margin = abs(change)
+            except (ValueError, TypeError):
+                pass
+        p_data['margin'] = margin
 
     for p_data in positions_data:
         symbol = p_data['symbol']
@@ -451,6 +497,9 @@ async def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) ->
             p_data['contract_details']['priceMagnifier'] = int(cd.priceMagnifier) if cd.priceMagnifier else 1
             # Capture the mdSizeMultiplier, which often represents the point value or contract size.
             p_data['contract_details']['mdSizeMultiplier'] = int(cd.mdSizeMultiplier) if cd.mdSizeMultiplier is not None else None
+            
+            # Cache the full ContractDetails object for use in get_market_statuses_for_all
+            p_data['contract_details']['ib_contract_details'] = cd
 
         # Recalculate market values and P/L
         avg_cost = p_data['avg_cost']

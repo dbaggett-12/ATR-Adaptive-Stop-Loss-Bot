@@ -379,16 +379,18 @@ class ATRWindow(QMainWindow):
         self.tabs.addTab(self.positions_tab, "Positions")
 
         self.table = QTableWidget()
-        self.table.setColumnCount(11)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet("QTableWidget { background-color: black; alternate-background-color: #111111; }")
+        self.table.setColumnCount(12)
         self.table.setHorizontalHeaderLabels([
-            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", 
+            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", "Margin",
             "Current Price", "Computed Stop Loss", "", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.setColumnWidth(0, 50) # "Send" column
-        self.table.setColumnWidth(7, 50) # Ratchet status column
-        self.table.setColumnWidth(10, 180) # "Status" column
+        self.table.setColumnWidth(8, 50) # Ratchet status column
         self.positions_layout.addWidget(self.table)
 
         # --- ATR Calculations Tab ---
@@ -588,15 +590,18 @@ class ATRWindow(QMainWindow):
                 # Column 4: Positions Held
                 self.table.setItem(i, 4, QTableWidgetItem(str(p_data['positions_held'])))
                 
-                # Column 5: Current Price
-                self.table.setItem(i, 5, QTableWidgetItem(f"{p_data.get('current_price', 0):.2f}"))
+                # Column 5: Margin
+                self.table.setItem(i, 5, QTableWidgetItem(f"${p_data.get('margin', 0):,.2f}"))
 
-                # Column 6: Computed Stop Loss
+                # Column 6: Current Price
+                self.table.setItem(i, 6, QTableWidgetItem(f"{p_data.get('current_price', 0):.2f}"))
+
+                # Column 7: Computed Stop Loss
                 computed_stop = p_data.get('computed_stop_loss')
                 stop_display = f"{computed_stop:.4f}" if computed_stop is not None else "N/A"
-                self.table.setItem(i, 6, QTableWidgetItem(stop_display))
+                self.table.setItem(i, 7, QTableWidgetItem(stop_display))
 
-                # Column 7: Stop Status Icon (New)
+                # Column 8: Stop Status Icon (New)
                 stop_status = p_data.get('stop_status', 'new') # Default to 'new'
                 status_item = QTableWidgetItem()
                 status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -610,23 +615,23 @@ class ATRWindow(QMainWindow):
                     status_item.setForeground(QColor('orange'))
                     status_item.setToolTip("Stop loss held by ratchet (previous stop was higher).")
 
-                self.table.setItem(i, 7, status_item)
+                self.table.setItem(i, 8, status_item)
 
-                # Column 8: $ Risk
+                # Column 9: $ Risk
                 risk_value = p_data.get('dollar_risk', 0)
                 risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
-                self.table.setItem(i, 8, risk_item)
+                self.table.setItem(i, 9, risk_item)
 
-                # Column 9: % Risk
+                # Column 10: % Risk
                 percent_risk = p_data.get('percent_risk', 0.0)
                 percent_risk_item = QTableWidgetItem(f"{percent_risk:.2f}%")
 
                 if percent_risk > 2.0:
                     percent_risk_item.setForeground(QColor('red'))
-                self.table.setItem(i, 9, percent_risk_item)
+                self.table.setItem(i, 10, percent_risk_item)
 
-                # Column 10: Status
-                self.table.setItem(i, 10, QTableWidgetItem(p_data.get('status', '...')))
+                # Column 11: Status
+                self.table.setItem(i, 11, QTableWidgetItem(p_data.get('status', '...')))
 
             except Exception as e:
                 symbol = p_data.get('symbol', 'UNKNOWN')
@@ -672,9 +677,9 @@ class ATRWindow(QMainWindow):
         new_risk_dollar, new_risk_percent = calculator.calculate_risk(p_data, new_stop)
 
         # Update the UI with the new values
-        self.table.item(row, 6).setText(f"{new_stop:.4f}" if new_stop is not None and isinstance(new_stop, (int, float)) else "N/A")
-        self.table.item(row, 8).setText(f"${new_risk_dollar:,.2f}")
-        self.table.item(row, 9).setText(f"{new_risk_percent:.2f}%")
+        self.table.item(row, 7).setText(f"{new_stop:.4f}" if new_stop is not None and isinstance(new_stop, (int, float)) else "N/A")
+        self.table.item(row, 9).setText(f"${new_risk_dollar:,.2f}")
+        self.table.item(row, 10).setText(f"{new_risk_percent:.2f}%")
 
     def get_atr_ratio_for_symbol(self, symbol):
         """Finds the ATR ratio for a symbol from the UI table."""
