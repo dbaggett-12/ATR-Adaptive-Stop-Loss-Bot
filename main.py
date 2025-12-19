@@ -34,6 +34,27 @@ ATR_STATE_FILE = 'atr_state.json'
 ATR_HISTORY_FILE = 'atr_history.json' # For graphing
 STOP_HISTORY_FILE = 'stop_history.json'
 
+class NumericTableWidgetItem(QTableWidgetItem):
+    """
+    Custom TableWidgetItem to enable proper numerical sorting.
+    Stores the raw numerical value in UserRole.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def __lt__(self, other):
+        try:
+            # Retrieve data from UserRole
+            val1 = self.data(Qt.ItemDataRole.UserRole)
+            val2 = other.data(Qt.ItemDataRole.UserRole)
+            
+            v1 = float(val1) if val1 is not None else -float('inf')
+            v2 = float(val2) if val2 is not None else -float('inf')
+            
+            return v1 < v2
+        except (ValueError, TypeError):
+            # Fallback to string comparison if conversion fails
+            return super().__lt__(other)
 
 class DataWorker(QObject):
     """
@@ -391,6 +412,7 @@ class ATRWindow(QMainWindow):
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.setColumnWidth(0, 50) # "Send" column
         self.table.setColumnWidth(8, 50) # Ratchet status column
+        self.table.setSortingEnabled(True)
         self.positions_layout.addWidget(self.table)
 
         # --- ATR Calculations Tab ---
@@ -536,12 +558,25 @@ class ATRWindow(QMainWindow):
 
     def populate_positions_table(self):
         """Populates the main table with fully processed data. No calculations here."""
+        # Save current sort state to restore after repopulating
+        current_sort_col = self.table.horizontalHeader().sortIndicatorSection()
+        current_sort_order = self.table.horizontalHeader().sortIndicatorOrder()
+        
+        # Disable sorting during population to improve performance and prevent auto-sorting artifacts
+        self.table.setSortingEnabled(False)
+        
         self.table.setRowCount(len(self.positions_data))
         for i, p_data in enumerate(self.positions_data):
             try:
                 symbol = p_data['symbol']
                 
                 # Column 0: "Send Stop" Checkbox
+                # Add a hidden item for sorting based on enabled state
+                is_enabled = self.symbol_stop_enabled.get(symbol, True)
+                item_0 = NumericTableWidgetItem()
+                item_0.setData(Qt.ItemDataRole.UserRole, 1 if is_enabled else 0)
+                self.table.setItem(i, 0, item_0)
+
                 checkbox_widget = QWidget()
                 checkbox_layout = QHBoxLayout(checkbox_widget)
                 checkbox = QCheckBox()
@@ -574,32 +609,50 @@ class ATRWindow(QMainWindow):
                 # Column 2: ATR - Get ATR value from ATR calculations tab
                 atr_value = p_data.get('atr_value')
                 atr_display = f"{atr_value:.4f}" if atr_value is not None else "N/A"
-                self.table.setItem(i, 2, QTableWidgetItem(atr_display)) # Display with more precision
+                item_2 = NumericTableWidgetItem(atr_display)
+                item_2.setData(Qt.ItemDataRole.UserRole, atr_value if atr_value is not None else -1.0)
+                self.table.setItem(i, 2, item_2)
 
                 # Column 3: ATR Ratio editable spin box
+                ratio_val = p_data.get('atr_ratio', 1.5)
+                item_3 = NumericTableWidgetItem()
+                item_3.setData(Qt.ItemDataRole.UserRole, ratio_val)
+                self.table.setItem(i, 3, item_3)
+
                 spin = QDoubleSpinBox()
                 spin.setMinimum(0.1)
                 spin.setMaximum(10.0)
                 spin.setSingleStep(0.1)
                 spin.setDecimals(1)
-                spin.setValue(p_data.get('atr_ratio', 1.5))
+                spin.setValue(ratio_val)
                 spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
                 spin.valueChanged.connect(lambda val, row=i, symbol=symbol: self.on_atr_ratio_changed(row, symbol, val))
                 self.table.setCellWidget(i, 3, spin)
 
                 # Column 4: Positions Held
-                self.table.setItem(i, 4, QTableWidgetItem(str(p_data['positions_held'])))
+                pos_held = p_data['positions_held']
+                item_4 = NumericTableWidgetItem(str(pos_held))
+                item_4.setData(Qt.ItemDataRole.UserRole, pos_held)
+                self.table.setItem(i, 4, item_4)
                 
                 # Column 5: Margin
-                self.table.setItem(i, 5, QTableWidgetItem(f"${p_data.get('margin', 0):,.2f}"))
+                margin = p_data.get('margin', 0)
+                item_5 = NumericTableWidgetItem(f"${margin:,.2f}")
+                item_5.setData(Qt.ItemDataRole.UserRole, margin)
+                self.table.setItem(i, 5, item_5)
 
                 # Column 6: Current Price
-                self.table.setItem(i, 6, QTableWidgetItem(f"{p_data.get('current_price', 0):.2f}"))
+                price = p_data.get('current_price', 0)
+                item_6 = NumericTableWidgetItem(f"{price:.2f}")
+                item_6.setData(Qt.ItemDataRole.UserRole, price)
+                self.table.setItem(i, 6, item_6)
 
                 # Column 7: Computed Stop Loss
                 computed_stop = p_data.get('computed_stop_loss')
                 stop_display = f"{computed_stop:.4f}" if computed_stop is not None else "N/A"
-                self.table.setItem(i, 7, QTableWidgetItem(stop_display))
+                item_7 = NumericTableWidgetItem(stop_display)
+                item_7.setData(Qt.ItemDataRole.UserRole, computed_stop if computed_stop is not None else -1.0)
+                self.table.setItem(i, 7, item_7)
 
                 # Column 8: Stop Status Icon (New)
                 stop_status = p_data.get('stop_status', 'new') # Default to 'new'
@@ -619,16 +672,18 @@ class ATRWindow(QMainWindow):
 
                 # Column 9: $ Risk
                 risk_value = p_data.get('dollar_risk', 0)
-                risk_item = QTableWidgetItem(f"${risk_value:,.2f}")
-                self.table.setItem(i, 9, risk_item)
+                item_9 = NumericTableWidgetItem(f"${risk_value:,.2f}")
+                item_9.setData(Qt.ItemDataRole.UserRole, risk_value)
+                self.table.setItem(i, 9, item_9)
 
                 # Column 10: % Risk
                 percent_risk = p_data.get('percent_risk', 0.0)
-                percent_risk_item = QTableWidgetItem(f"{percent_risk:.2f}%")
+                item_10 = NumericTableWidgetItem(f"{percent_risk:.2f}%")
+                item_10.setData(Qt.ItemDataRole.UserRole, percent_risk)
 
                 if percent_risk > 2.0:
-                    percent_risk_item.setForeground(QColor('red'))
-                self.table.setItem(i, 10, percent_risk_item)
+                    item_10.setForeground(QColor('red'))
+                self.table.setItem(i, 10, item_10)
 
                 # Column 11: Status
                 self.table.setItem(i, 11, QTableWidgetItem(p_data.get('status', '...')))
@@ -636,6 +691,15 @@ class ATRWindow(QMainWindow):
             except Exception as e:
                 symbol = p_data.get('symbol', 'UNKNOWN')
                 logging.error(f"Error populating table for symbol {symbol}: {e}")
+        
+        # Re-enable sorting
+        self.table.setSortingEnabled(True)
+        # Restore previous sort if it existed
+        if current_sort_col != -1:
+            try:
+                self.table.sortItems(current_sort_col, current_sort_order)
+            except Exception as e:
+                logging.error(f"Error sorting table: {e}")
 
     def on_atr_ratio_changed(self, row, symbol, value):
         """
