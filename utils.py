@@ -44,7 +44,7 @@ CONTRACT_POINT_VALUES = {
     
     # Micro Agricultural Futures (1/10th of standard)
     'MZC': 5.0,      # Micro Corn: 500 bushels × $0.01 = $5 per 1 cent move
-    'MZS': 10.0,     # Micro Soybeans: 1000 bushels × $0.01 = $10 per 1 cent move
+    'MZS': 5.0,     # Micro Soybeans: 500 bushels × $0.01 = $10 per 1 cent move
     'MZW': 5.0,      # Micro Wheat: 500 bushels × $0.01 = $5 per 1 cent move
     'MZM': 10.0,     # Micro Soybean Meal: 10 tons × $1.00 = $10 per point
     'MZL': 60.0,     # Micro Soybean Oil: 6000 lbs × $0.01 = $60 per 1 cent move

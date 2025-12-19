@@ -398,16 +398,16 @@ class ATRWindow(QMainWindow):
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("QTableWidget { background-color: black; alternate-background-color: #111111; }")
-        self.table.setColumnCount(12)
+        self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
-            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", "Margin",
+            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", "Avg Cost", "Margin",
             "Current Price", "Computed Stop Loss", "", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.setColumnWidth(0, 50) # "Send" column
-        self.table.setColumnWidth(8, 50) # Ratchet status column
+        self.table.setColumnWidth(9, 50) # Ratchet status column
         self.table.setSortingEnabled(True)
         self.positions_layout.addWidget(self.table)
 
@@ -630,26 +630,32 @@ class ATRWindow(QMainWindow):
                 item_4.setData(Qt.ItemDataRole.UserRole, pos_held)
                 self.table.setItem(i, 4, item_4)
                 
-                # Column 5: Margin
-                margin = p_data.get('margin', 0)
-                item_5 = NumericTableWidgetItem(f"${margin:,.2f}")
-                item_5.setData(Qt.ItemDataRole.UserRole, margin)
+                # Column 5: Avg Cost
+                avg_cost = p_data.get('avg_cost', 0.0)
+                item_5 = NumericTableWidgetItem(f"{avg_cost:,.2f}")
+                item_5.setData(Qt.ItemDataRole.UserRole, avg_cost)
                 self.table.setItem(i, 5, item_5)
 
-                # Column 6: Current Price
-                price = p_data.get('current_price', 0)
-                item_6 = NumericTableWidgetItem(f"{price:.2f}")
-                item_6.setData(Qt.ItemDataRole.UserRole, price)
+                # Column 6: Margin
+                margin = p_data.get('margin', 0)
+                item_6 = NumericTableWidgetItem(f"${margin:,.2f}")
+                item_6.setData(Qt.ItemDataRole.UserRole, margin)
                 self.table.setItem(i, 6, item_6)
 
-                # Column 7: Computed Stop Loss
-                computed_stop = p_data.get('computed_stop_loss')
-                stop_display = f"{computed_stop:.4f}" if computed_stop is not None else "N/A"
-                item_7 = NumericTableWidgetItem(stop_display)
-                item_7.setData(Qt.ItemDataRole.UserRole, computed_stop if computed_stop is not None else -1.0)
+                # Column 7: Current Price
+                price = p_data.get('current_price', 0)
+                item_7 = NumericTableWidgetItem(f"{price:.2f}")
+                item_7.setData(Qt.ItemDataRole.UserRole, price)
                 self.table.setItem(i, 7, item_7)
 
-                # Column 8: Stop Status Icon (New)
+                # Column 8: Computed Stop Loss
+                computed_stop = p_data.get('computed_stop_loss')
+                stop_display = f"{computed_stop:.4f}" if computed_stop is not None else "N/A"
+                item_8 = NumericTableWidgetItem(stop_display)
+                item_8.setData(Qt.ItemDataRole.UserRole, computed_stop if computed_stop is not None else -1.0)
+                self.table.setItem(i, 8, item_8)
+
+                # Column 9: Stop Status Icon (New)
                 stop_status = p_data.get('stop_status', 'new') # Default to 'new'
                 status_item = QTableWidgetItem()
                 status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -663,25 +669,32 @@ class ATRWindow(QMainWindow):
                     status_item.setForeground(QColor('orange'))
                     status_item.setToolTip("Stop loss held by ratchet (previous stop was higher).")
 
-                self.table.setItem(i, 8, status_item)
+                self.table.setItem(i, 9, status_item)
 
-                # Column 9: $ Risk
+                # Column 10: $ Risk
                 risk_value = p_data.get('dollar_risk', 0)
-                item_9 = NumericTableWidgetItem(f"${risk_value:,.2f}")
-                item_9.setData(Qt.ItemDataRole.UserRole, risk_value)
-                self.table.setItem(i, 9, item_9)
-
-                # Column 10: % Risk
-                percent_risk = p_data.get('percent_risk', 0.0)
-                item_10 = NumericTableWidgetItem(f"{percent_risk:.2f}%")
-                item_10.setData(Qt.ItemDataRole.UserRole, percent_risk)
-
-                if percent_risk > 2.0:
-                    item_10.setForeground(QColor('red'))
+                if risk_value == "NO RISK":
+                    item_10 = NumericTableWidgetItem("NO RISK")
+                    item_10.setData(Qt.ItemDataRole.UserRole, 0)
+                    item_10.setBackground(QColor(0, 50, 0))
+                    item_10.setForeground(QColor('lightgreen'))
+                else:
+                    item_10 = NumericTableWidgetItem(f"${risk_value:,.2f}")
+                    item_10.setData(Qt.ItemDataRole.UserRole, risk_value)
+                
                 self.table.setItem(i, 10, item_10)
 
-                # Column 11: Status
-                self.table.setItem(i, 11, QTableWidgetItem(p_data.get('status', '...')))
+                # Column 11: % Risk
+                percent_risk = p_data.get('percent_risk', 0.0)
+                item_11 = NumericTableWidgetItem(f"{percent_risk:.2f}%")
+                item_11.setData(Qt.ItemDataRole.UserRole, percent_risk)
+
+                if percent_risk > 2.0:
+                    item_11.setForeground(QColor('red'))
+                self.table.setItem(i, 11, item_11)
+
+                # Column 12: Status
+                self.table.setItem(i, 12, QTableWidgetItem(p_data.get('status', '...')))
 
             except Exception as e:
                 symbol = p_data.get('symbol', 'UNKNOWN')
@@ -736,9 +749,21 @@ class ATRWindow(QMainWindow):
         new_risk_dollar, new_risk_percent = calculator.calculate_risk(p_data, new_stop)
 
         # Update the UI with the new values
-        self.table.item(row, 7).setText(f"{new_stop:.4f}" if new_stop is not None and isinstance(new_stop, (int, float)) else "N/A")
-        self.table.item(row, 9).setText(f"${new_risk_dollar:,.2f}")
-        self.table.item(row, 10).setText(f"{new_risk_percent:.2f}%")
+        self.table.item(row, 8).setText(f"{new_stop:.4f}" if new_stop is not None and isinstance(new_stop, (int, float)) else "N/A")
+        
+        item_10 = self.table.item(row, 10)
+        if new_risk_dollar == "NO RISK":
+            item_10.setText("NO RISK")
+            item_10.setData(Qt.ItemDataRole.UserRole, 0)
+            item_10.setBackground(QColor(0, 50, 0))
+            item_10.setForeground(QColor('lightgreen'))
+        else:
+            item_10.setText(f"${new_risk_dollar:,.2f}")
+            item_10.setData(Qt.ItemDataRole.UserRole, new_risk_dollar)
+            item_10.setData(Qt.ItemDataRole.BackgroundRole, None)
+            item_10.setData(Qt.ItemDataRole.ForegroundRole, None)
+            
+        self.table.item(row, 11).setText(f"{new_risk_percent:.2f}%")
 
     def get_atr_ratio_for_symbol(self, symbol):
         """Finds the ATR ratio for a symbol from the UI table."""

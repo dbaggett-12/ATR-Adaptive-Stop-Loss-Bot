@@ -7,6 +7,7 @@ import logging
 import pytz
 import math
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from utils import get_point_value
 
 def fetch_positions():
     """
@@ -370,14 +371,6 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
             except (ValueError, TypeError):
                 multiplier = 1.0
         
-        # For futures, avgCost is the total value (price * multiplier * quantity).
-        # We need to derive the price per contract.
-        # For stocks, avgCost is already the price per share.
-        if sec_type == 'FUT' and multiplier > 1 and positions_held != 0:
-            avg_cost = raw_avg_cost / (multiplier * positions_held)
-        else:
-            avg_cost = raw_avg_cost
-
         contract_details = {
             'secType': sec_type,
             'exchange': pos.contract.exchange or '',
@@ -385,6 +378,14 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
             'lastTradeDateOrContractMonth': pos.contract.lastTradeDateOrContractMonth or '',
             'conId': pos.contract.conId or 0,
         }
+        
+        # Use point value to determine price from avgCost (which is per-contract value for futures)
+        point_value = get_point_value(symbol, contract_details, multiplier)
+
+        if sec_type == 'FUT' and point_value > 0:
+            avg_cost = raw_avg_cost / point_value
+        else:
+            avg_cost = raw_avg_cost
 
         results.append({
             'position': pos.contract.symbol,

@@ -86,10 +86,16 @@ class PortfolioCalculator:
         """Calculates the dollar and percentage risk for a position."""
         risk_value = 0
         percent_risk = 0.0
-        current_price = position_data.get('current_price', 0)
+        avg_cost = position_data.get('avg_cost', 0)
+        quantity = position_data.get('positions_held', 0)
 
-        if computed_stop and current_price > 0:
-            risk_in_points = abs(current_price - computed_stop)
+        if computed_stop and avg_cost > 0:
+            # Check for "NO RISK" condition (Stop is better than entry)
+            is_long = quantity > 0
+            if (is_long and computed_stop >= avg_cost) or (not is_long and computed_stop <= avg_cost):
+                return "NO RISK", 0.0
+
+            risk_in_points = abs(avg_cost - computed_stop)
             
             point_value = get_point_value(
                 position_data['symbol'], 
@@ -97,7 +103,7 @@ class PortfolioCalculator:
                 position_data.get('multiplier', 1.0)
             )
             
-            risk_value = risk_in_points * point_value * abs(position_data['positions_held'])
+            risk_value = risk_in_points * point_value * abs(quantity)
             
             hypothetical_account_value = 6000.0 # This could be a configurable setting
             if hypothetical_account_value > 0:
