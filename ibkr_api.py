@@ -1,4 +1,4 @@
-from ib_insync import IB, util, Contract, StopOrder
+from ib_insync import IB, util, Contract, StopOrder, Order
 from time import sleep
 import asyncio
 import random
@@ -7,6 +7,7 @@ import logging
 import pytz
 import math
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from utils import get_point_value
 
 def fetch_positions():
     """
@@ -175,23 +176,18 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
 
                 if existing_trade:
                     # --- This is an existing order, handle modification ---
-                    existing_order = existing_trade.order
                     # Compare rounded prices to avoid floating point issues
-                    if round(existing_order.stopPrice, 2) == round(stop_price, 2):
+                    if math.isclose(existing_trade.order.stopPrice, stop_price, rel_tol=1e-9, abs_tol=1e-9):
                         print(f"No change needed for {symbol}: Stop price is already {stop_price:.2f}")
                         results.append({'symbol': symbol, 'status': 'unchanged', 'message': 'Stop price is already correct.'})
                         continue
                     else:
-                        # To safely modify, create a new order object with the existing order's ID
-                        print(f"Modifying {symbol} stop order from {existing_order.stopPrice} to {stop_price:.2f}")
-                        stop_order = StopOrder(
-                            action=action,
-                            totalQuantity=order_quantity,
-                            stopPrice=round(stop_price, 2), # Explicitly round to 2 decimal places
-                            orderId=existing_order.orderId, # IMPORTANT: Use existing orderId
-                            tif='GTC'
-                        )
-                        trade = await ib.placeOrderAsync(contract, stop_order)
+                        # To modify, we must update the existing order object in-place.
+                        print(f"Modifying {symbol} stop order from {existing_trade.order.stopPrice} to {stop_price:.2f}")
+                        existing_order = existing_trade.order # Get the live order object
+                        existing_order.action = action
+                        existing_order.stopPrice = stop_price
+                        trade = ib.placeOrder(contract, existing_order)
                         trades_to_monitor.append(trade)
                 else:
                     # --- This is a new order, create it ---
@@ -199,10 +195,11 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
                     stop_order = StopOrder(
                         action=action,
                         totalQuantity=order_quantity,
-                        stopPrice=round(stop_price, 2), # Explicitly round to 2 decimal places
-                        tif='GTC'
+                        stopPrice=stop_price, # Price is pre-rounded by calculator
+                        tif='GTC',
+                        orderId=ib.client.getReqId() # Get a new unique ID for a new order
                     )
-                    trade = await ib.placeOrderAsync(contract, stop_order)
+                    trade = ib.placeOrder(contract, stop_order)
                     trades_to_monitor.append(trade)
 
             except Exception as e:
@@ -273,79 +270,71 @@ async def _submit_stop_loss_orders_internal(ib, stop_loss_data):
 
 async def get_market_statuses_for_all(ib: IB, contracts_info: dict) -> dict:
     """
-    Checks the market status for a batch of contracts in a single connection.
-    Each symbol is checked individually against its own trading hours and timezone.
+    Checks the market status for a batch of contracts using their explicit trading sessions.
+    Returns a detailed state: 'ACTIVE (RTH)', 'ACTIVE (NT)', or 'CLOSED'.
 
     Args:
         ib (IB): The connected ib_insync IB instance.
         contracts_info (dict): A dictionary mapping symbol to contract details dict.
 
     Returns:
-        dict: A dictionary mapping symbol to its market status ('OPEN', 'CLOSED', 'UNKNOWN').
+        dict: A dictionary mapping symbol to its detailed market status.
     """
-    statuses = {symbol: 'UNKNOWN' for symbol in contracts_info}
-    for symbol, details in contracts_info.items():
+    now_utc = datetime.now(pytz.utc)
+
+    async def check_status(symbol, details):
+        # Optimization: Use cached ContractDetails if available from fetch_market_data_for_positions
+        cd = details.get('ib_contract_details')
+
+        if not cd:
             con_id = details.get('conId')
             if not con_id:
-                logging.warning(f"No conId for {symbol}, skipping market status check")
-                continue
+                logging.warning(f"No conId for {symbol}, skipping market status check.")
+                return symbol, 'CLOSED'
 
             try:
-                contract = Contract(conId=con_id)
+                # Include exchange for robustness
+                contract = Contract(conId=con_id, exchange=details.get('exchange', ''))
                 cds = await ib.reqContractDetailsAsync(contract)
-                
                 if not cds:
-                    logging.warning(f"No contract details returned for {symbol} (conId: {con_id})")
-                    continue
-
+                    logging.warning(f"No contract details for {symbol}, marking as CLOSED.")
+                    return symbol, 'CLOSED'
                 cd = cds[0]
-                
-                # Use the built-in liquidSessions() method which properly parses
-                # trading hours and handles timezones correctly for each contract
-                # liquidSessions returns sessions with timezone-aware datetimes
-                try:
-                    sessions = cd.liquidSessions()
-                except Exception as session_err:
-                    # Fallback to tradingSessions if liquidSessions fails
-                    logging.warning(f"liquidSessions failed for {symbol}, trying tradingSessions: {session_err}")
-                    try:
-                        sessions = cd.tradingSessions()
-                    except Exception as trading_err:
-                        logging.error(f"Both session methods failed for {symbol}: {trading_err}")
-                        continue
-                
-                if not sessions:
-                    # No sessions means market is closed or no trading hours defined
-                    logging.info(f"No trading sessions found for {symbol}, marking as CLOSED")
-                    statuses[symbol] = 'CLOSED'
-                    continue
-                
-                # Get the current time in UTC, which is what liquidSessions uses.
-                now_utc = datetime.now(pytz.utc)
-                time_zone_id = cd.timeZoneId
-                
-                is_open = False
-                for session in sessions:
-                    # session is a TradingSession namedtuple with start and end (timezone-aware datetimes)
-                    # These are already in UTC.
-                    session_start = session.start
-                    session_end = session.end
-                    
-                    # Compare the current UTC time with the session's UTC start and end times.
-                    if session_start <= now_utc < session_end:
-                        is_open = True
-                        logging.debug(
-                            f"{symbol}: Market OPEN. Current UTC time {now_utc.strftime('%H:%M:%S')} "
-                            f"is within session {session_start.strftime('%H:%M:%S')} - {session_end.strftime('%H:%M:%S')}"
-                        )
-                        break
-                
-                statuses[symbol] = 'OPEN' if is_open else 'CLOSED'
-                logging.info(f"Market status for {symbol}: {statuses[symbol]} (timezone: {time_zone_id})")
-                
             except Exception as e:
                 logging.error(f"Error checking market status for {symbol}: {e}")
-    return statuses
+                return symbol, 'CLOSED'
+
+        try:
+            # liquidSessions() returns timezone-aware UTC datetimes for Regular Trading Hours (RTH)
+            rth_sessions = cd.liquidSessions()
+            # tradingSessions() returns timezone-aware UTC datetimes for the full session (including overnight)
+            full_sessions = cd.tradingSessions()
+
+            # 1. Check for ACTIVE (RTH)
+            if rth_sessions:
+                for session in rth_sessions:
+                    if session.start <= now_utc < session.end:
+                        logging.info(f"Market status for {symbol}: ACTIVE (RTH)")
+                        return symbol, 'ACTIVE (RTH)'
+
+            # 2. Check for ACTIVE (NT) - Night Trading / Electronic Hours
+            if full_sessions:
+                for session in full_sessions:
+                    if session.start <= now_utc < session.end:
+                        logging.info(f"Market status for {symbol}: ACTIVE (NT)")
+                        return symbol, 'ACTIVE (NT)'
+
+        except Exception as e:
+            logging.error(f"Error checking market status for {symbol}: {e}")
+            return symbol, 'CLOSED'
+
+        # 3. If neither, it's CLOSED. This is the safe default.
+        logging.info(f"Market status for {symbol}: CLOSED (no active session found)")
+        return symbol, 'CLOSED'
+
+    tasks = [check_status(symbol, details) for symbol, details in contracts_info.items()]
+    results = await asyncio.gather(*tasks)
+    return dict(results)
 
 async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]:
     """
@@ -357,10 +346,18 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
     if not positions:
         return results
 
-    contracts_to_qualify = [pos.contract for pos in positions]
+    # Filter out positions with zero quantity before doing any work
+    active_positions = [p for p in positions if p.position != 0]
+    if not active_positions:
+        logging.info("No active positions with non-zero quantity found.")
+        return results
+    
+    logging.info(f"Found {len(active_positions)} active positions out of {len(positions)} total.")
+
+    contracts_to_qualify = [pos.contract for pos in active_positions]
     await ib.qualifyContractsAsync(*contracts_to_qualify)
 
-    for pos in positions:
+    for pos in active_positions:
         positions_held = float(pos.position)
         raw_avg_cost = float(pos.avgCost)
         symbol = pos.contract.symbol
@@ -374,14 +371,6 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
             except (ValueError, TypeError):
                 multiplier = 1.0
         
-        # For futures, avgCost is the total value (price * multiplier * quantity).
-        # We need to derive the price per contract.
-        # For stocks, avgCost is already the price per share.
-        if sec_type == 'FUT' and multiplier > 1 and positions_held != 0:
-            avg_cost = raw_avg_cost / (multiplier * positions_held)
-        else:
-            avg_cost = raw_avg_cost
-
         contract_details = {
             'secType': sec_type,
             'exchange': pos.contract.exchange or '',
@@ -389,6 +378,14 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
             'lastTradeDateOrContractMonth': pos.contract.lastTradeDateOrContractMonth or '',
             'conId': pos.contract.conId or 0,
         }
+        
+        # Use point value to determine price from avgCost (which is per-contract value for futures)
+        point_value = get_point_value(symbol, contract_details, multiplier)
+
+        if sec_type == 'FUT' and point_value > 0:
+            avg_cost = raw_avg_cost / point_value
+        else:
+            avg_cost = raw_avg_cost
 
         results.append({
             'position': pos.contract.symbol,
@@ -403,6 +400,7 @@ async def fetch_basic_positions(ib: IB, positions: List[Position]) -> List[Dict]
             'market_value': 0.0,
             'unrealized_pl': 0.0,
             'pl_percent': 0.0,
+            'margin': 0.0,
         })
     return results
 
@@ -435,9 +433,45 @@ async def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) ->
         contract = Contract(conId=p['contract_details']['conId'], exchange=p['contract_details'].get('exchange', ''))
         tickers[p['symbol']] = ib.reqMktData(contract, "", False, False)
     
-    logging.info("Waiting for market data to populate...")
-    await asyncio.sleep(5)
-    logging.info("Finished waiting for market data.")
+    # --- Fetch Margin Requirements (Concurrent with Market Data Wait) ---
+    async def fetch_margin_safe(contract, order):
+        try:
+            order.whatIf = True
+            return await ib.whatIfOrderAsync(contract, order)
+        except Exception as e:
+            logging.debug(f"Margin fetch failed for {contract.symbol}: {e}")
+            return None
+
+    margin_tasks = []
+    for p in positions_data:
+        # Simulate closing the position to see margin release
+        action = 'SELL' if p['positions_held'] > 0 else 'BUY'
+        qty = abs(p['positions_held'])
+        contract = Contract(conId=p['contract_details']['conId'], exchange=p['contract_details'].get('exchange', ''))
+        order = Order(action=action, totalQuantity=qty, orderType='MKT', tif='DAY')
+        margin_tasks.append(fetch_margin_safe(contract, order))
+
+    logging.info("Waiting for market data to populate and fetching margins...")
+    
+    # Run sleep and margin fetch concurrently
+    # We wait at least 5 seconds for market data, and ensure margin tasks complete
+    results = await asyncio.gather(asyncio.sleep(5), asyncio.gather(*margin_tasks, return_exceptions=True))
+    margin_results = results[1]
+    
+    logging.info("Finished waiting for market data and margins.")
+
+    # Process margin results
+    for p_data, result in zip(positions_data, margin_results):
+        margin = 0.0
+        if result and not isinstance(result, Exception):
+            try:
+                # maintMarginChange is negative when closing releases margin
+                change = float(result.maintMarginChange)
+                if abs(change) < 1e308: # Check for valid value (not max double)
+                    margin = abs(change)
+            except (ValueError, TypeError):
+                pass
+        p_data['margin'] = margin
 
     for p_data in positions_data:
         symbol = p_data['symbol']
@@ -464,6 +498,9 @@ async def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) ->
             p_data['contract_details']['priceMagnifier'] = int(cd.priceMagnifier) if cd.priceMagnifier else 1
             # Capture the mdSizeMultiplier, which often represents the point value or contract size.
             p_data['contract_details']['mdSizeMultiplier'] = int(cd.mdSizeMultiplier) if cd.mdSizeMultiplier is not None else None
+            
+            # Cache the full ContractDetails object for use in get_market_statuses_for_all
+            p_data['contract_details']['ib_contract_details'] = cd
 
         # Recalculate market values and P/L
         avg_cost = p_data['avg_cost']
