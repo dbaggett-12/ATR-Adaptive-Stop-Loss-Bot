@@ -57,7 +57,7 @@ class DataWorker(QObject):
     Worker thread for fetching and processing all IBKR data.
     This runs in the background to keep the UI responsive.
     """
-    finished = pyqtSignal()
+    finished = pyqtSignal(bool)
     error = pyqtSignal(str)
     # This single signal will carry all the calculated data for the UI
     data_ready = pyqtSignal(list, dict, dict) # Emits (final_positions_data, updated_atr_state, updated_atr_history)
@@ -76,6 +76,7 @@ class DataWorker(QObject):
     async def run_async(self):
         """Main worker method, executes all data stages sequentially."""
         ib = IB()
+        success = False
         try:
             # Determine port based on trading mode
             port = 7496 if self.atr_window.trading_mode == 'LIVE' else 7497
@@ -154,13 +155,15 @@ class DataWorker(QObject):
             else:
                 logging.info("Adaptive stops are DISABLED. Skipping order submission.")
                 self.orders_submitted.emit([]) # Emit empty list to clear old statuses
+            
+            success = True
 
         except Exception as e:
             self.error.emit(str(e))
         finally:
             if ib.isConnected():
                 ib.disconnect()
-            self.finished.emit()
+            self.finished.emit(success)
 
     def run(self):
         """Synchronous entry point that runs the async run_async method."""
@@ -400,7 +403,7 @@ class ATRWindow(QMainWindow):
         self.table.setStyleSheet("QTableWidget { background-color: black; alternate-background-color: #111111; }")
         self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
-            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", "Avg Cost", "Margin",
+            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", "Margin", "Avg Cost",
             "Current Price", "Computed Stop Loss", "", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -630,16 +633,16 @@ class ATRWindow(QMainWindow):
                 item_4.setData(Qt.ItemDataRole.UserRole, pos_held)
                 self.table.setItem(i, 4, item_4)
                 
-                # Column 5: Avg Cost
-                avg_cost = p_data.get('avg_cost', 0.0)
-                item_5 = NumericTableWidgetItem(f"{avg_cost:,.2f}")
-                item_5.setData(Qt.ItemDataRole.UserRole, avg_cost)
+                # Column 5: Margin
+                margin = p_data.get('margin', 0)
+                item_5 = NumericTableWidgetItem(f"${margin:,.2f}")
+                item_5.setData(Qt.ItemDataRole.UserRole, margin)
                 self.table.setItem(i, 5, item_5)
 
-                # Column 6: Margin
-                margin = p_data.get('margin', 0)
-                item_6 = NumericTableWidgetItem(f"${margin:,.2f}")
-                item_6.setData(Qt.ItemDataRole.UserRole, margin)
+                # Column 6: Avg Cost
+                avg_cost = p_data.get('avg_cost', 0.0)
+                item_6 = NumericTableWidgetItem(f"{avg_cost:,.2f}")
+                item_6.setData(Qt.ItemDataRole.UserRole, avg_cost)
                 self.table.setItem(i, 6, item_6)
 
                 # Column 7: Current Price
@@ -939,10 +942,10 @@ class ATRWindow(QMainWindow):
         self.worker_thread.start()
         logging.info("Worker started for full refresh cycle.")
 
-    def on_worker_finished(self):
+    def on_worker_finished(self, success):
         """Called when the worker's run() method completes."""
         logging.info("Worker has finished all stages.")
-        self.update_status(True)
+        self.update_status(success)
         self.update_timestamp()
 
     def update_timestamp(self):
