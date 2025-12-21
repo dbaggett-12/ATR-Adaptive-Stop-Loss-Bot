@@ -5,6 +5,7 @@ import threading
 import random
 import json
 import os
+import shutil
 from datetime import datetime, timedelta
 from PyQt6 import QtGui, QtCore
 from PyQt6.QtWidgets import (
@@ -24,6 +25,29 @@ from atr_processor import ATRProcessor
 from calculator import PortfolioCalculator
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- User Data Directory ---
+# This is the correct place for user-writable files like settings and state.
+USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".atrTrailingStop")
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+logging.info(f"Using user data directory: {USER_DATA_DIR}")
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+USER_SETTINGS_FILE = "user_settings.json"
+
+# --- Default Settings File Handling ---
+# This ensures a default user_settings.json is available in the user's data directory.
+default_settings_src = resource_path(USER_SETTINGS_FILE)
+user_settings_dest = os.path.join(USER_DATA_DIR, USER_SETTINGS_FILE)
+
+# Only copy if the destination doesn't exist and the source (in bundle) does.
+if not os.path.exists(user_settings_dest) and os.path.exists(default_settings_src):
+    shutil.copy(default_settings_src, user_settings_dest)
+    logging.info(f"Created default settings file at: {user_settings_dest}")
 
 # --- Constants ---
 ATR_STATE_FILE = 'atr_state.json'
@@ -260,21 +284,21 @@ class ATRWindow(QMainWindow):
         # State and History file paths and locks
         self.atr_state_file_lock = threading.Lock()
         self.atr_history_file_lock = threading.Lock()
-        self.atr_state_file = os.path.join(os.path.dirname(__file__), ATR_STATE_FILE)
-        self.atr_history_file = os.path.join(os.path.dirname(__file__), ATR_HISTORY_FILE)
+        self.atr_state_file = os.path.join(USER_DATA_DIR, ATR_STATE_FILE)
+        self.atr_history_file = os.path.join(USER_DATA_DIR, ATR_HISTORY_FILE)
         
         self.atr_state = self.load_atr_state()
         self.atr_history = self.load_atr_history()
 
         # Load persistent stop loss history
-        self.stop_history_file = os.path.join(os.path.dirname(__file__), STOP_HISTORY_FILE)
+        self.stop_history_file = os.path.join(USER_DATA_DIR, STOP_HISTORY_FILE)
         self.highest_stop_losses = self.load_stop_history() # This is now loaded from a file
 
         # --- New: User Settings File and Loading ---
         # Set a default client_id before loading settings
         self.client_id = 1000 
         self.trading_mode = "PAPER" # Default trading mode
-        self.user_settings_file = os.path.join(os.path.dirname(__file__), 'user_settings.json')
+        self.user_settings_file = os.path.join(USER_DATA_DIR, USER_SETTINGS_FILE)
         # Load settings, which will update client_id if it exists in the file
         self.load_user_settings()
 
@@ -335,7 +359,8 @@ class ATRWindow(QMainWindow):
         
         # --- Add GIF in the middle ---
         self.gif_label = QLabel()
-        self.movie = QMovie("mambo-ume-usume.gif")
+        gif_path = resource_path(os.path.join('assets', 'mambo-ume-usume.gif'))
+        self.movie = QMovie(gif_path)
         self.gif_label.setMovie(self.movie)
         # Scale the GIF to 75% of its original size
         self.movie.setScaledSize(QSize(111, 111))

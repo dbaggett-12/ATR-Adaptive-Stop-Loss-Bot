@@ -1,0 +1,24 @@
+{
+  "client_id": 1000,
+  "trading_mode": "PAPER",
+  "symbol_stop_enabled": {
+    "MZL": false,
+    "MNQ": false,
+    "VEQT": false,
+    "MZW": false,
+    "MZC": false,
+    "MES": true,
+    "MHG": true,
+    "MGC": true,
+    "MYM": true,
+    "VFV": false,
+    "XQQ": false,
+    "QM": false,
+    "MZS": false,
+    "MZM": false,
+    "QG": true,
+    "M2K": true,
+    "MCL": true,
+    "M6E": false
+  }
+}
