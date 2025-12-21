@@ -1,6 +1,6 @@
 # calculator.py
 import logging
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 from utils import get_point_value # Import from the new utils file
 
@@ -28,21 +28,26 @@ class PortfolioCalculator:
         if atr_value is None or current_price <= 0:
             return self.highest_stop_losses.get(symbol, 0), 'held'
 
-        raw_stop = current_price - (atr_value * atr_ratio)
+        quantity = position_data.get('positions_held', 0)
+        is_long = quantity > 0
+
+        if is_long:
+            raw_stop = current_price - (atr_value * atr_ratio)
+        else:
+            # For short positions, stop is above the current price
+            raw_stop = current_price + (atr_value * atr_ratio)
 
         contract_details = position_data.get('contract_details', {})
         min_tick = contract_details.get('minTick')
-        quantity = position_data.get('positions_held', 0)
 
         final_stop = float(raw_stop)
         if min_tick and min_tick > 0 and quantity != 0:
             raw_stop_decimal = Decimal(str(raw_stop))
             min_tick_decimal = Decimal(str(min_tick))
             
-            # Round down for long positions (SELL stop), which is conservative.
-            # For short positions (BUY stop), this also rounds "down" (e.g., 100.7 -> 100.5), 
-            # which moves the stop further from the market, also a conservative move.
-            rounding_mode = ROUND_DOWN
+            # Round down for long positions (SELL stop) to keep stop away from price (lower).
+            # Round up for short positions (BUY stop) to keep stop away from price (higher).
+            rounding_mode = ROUND_DOWN if is_long else ROUND_UP
             
             rounded_stop_decimal = (raw_stop_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=rounding_mode) * min_tick_decimal
             final_stop = float(rounded_stop_decimal)
@@ -59,7 +64,6 @@ class PortfolioCalculator:
                 return final_stop, 'new'
             
             # If it's an existing position, apply ratcheting logic.
-            is_long = quantity > 0
             if is_long:
                 prev_highest = self.highest_stop_losses.get(symbol, 0)
                 # New stop must be higher than previous highest
@@ -84,31 +88,42 @@ class PortfolioCalculator:
 
     def calculate_risk(self, position_data, computed_stop):
         """Calculates the dollar and percentage risk for a position."""
-        risk_value = 0
-        percent_risk = 0.0
         avg_cost = position_data.get('avg_cost', 0)
         quantity = position_data.get('positions_held', 0)
 
-        if computed_stop and avg_cost > 0:
-            # Check for "NO RISK" condition (Stop is better than entry)
-            is_long = quantity > 0
-            if (is_long and computed_stop >= avg_cost) or (not is_long and computed_stop <= avg_cost):
+        # If there's no valid stop, cost, or position, there's no risk to calculate.
+        if computed_stop is None or avg_cost <= 0 or quantity == 0:
+            return 0, 0.0
+
+        is_long = quantity > 0
+        risk_in_points = 0
+
+        if is_long:
+            # For a long position, risk exists if the stop is below the entry price.
+            if computed_stop < avg_cost:
+                risk_in_points = avg_cost - computed_stop
+            else:
+                # Stop is at or above entry price, so there is no risk.
+                return "NO RISK", 0.0
+        else:  # is_short
+            # For a short position, risk exists if the stop is above the entry price.
+            if computed_stop > avg_cost:
+                risk_in_points = computed_stop - avg_cost
+            else:
+                # Stop is at or below entry price, so there is no risk.
                 return "NO RISK", 0.0
 
-            risk_in_points = abs(avg_cost - computed_stop)
-            
-            point_value = get_point_value(
-                position_data['symbol'], 
-                position_data.get('contract_details', {}), 
-                position_data.get('multiplier', 1.0)
-            )
-            
-            risk_value = risk_in_points * point_value * abs(quantity)
-            
-            hypothetical_account_value = 6000.0 # This could be a configurable setting
-            if hypothetical_account_value > 0:
-                percent_risk = (risk_value / hypothetical_account_value) * 100
-        
+        point_value = get_point_value(
+            position_data['symbol'],
+            position_data.get('contract_details', {}),
+            position_data.get('multiplier', 1.0)
+        )
+
+        risk_value = risk_in_points * point_value * abs(quantity)
+
+        hypothetical_account_value = 6000.0  # This could be a configurable setting
+        percent_risk = (risk_value / hypothetical_account_value) * 100 if hypothetical_account_value > 0 else 0.0
+
         return risk_value, percent_risk
 
     def process_positions(self, positions_data, atr_results):

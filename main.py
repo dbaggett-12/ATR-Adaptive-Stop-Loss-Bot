@@ -139,14 +139,16 @@ class DataWorker(QObject):
                 self.atr_window.atr_state_file, 
                 self.atr_window.atr_history_file, 
                 self.atr_window.atr_state_file_lock, 
-                self.atr_window.atr_history_file_lock)
-            atr_results, updated_atr_state, updated_atr_history = await atr_processor.run(ib, enriched_positions)
+                self.atr_window.atr_history_file_lock)            
+            
+            candle_settings = self.atr_window.get_all_candle_sizes()
+            atr_results, updated_atr_state, updated_atr_history = await atr_processor.run(ib, enriched_positions, candle_settings)
             # --- Instantiate and use the calculator ---
             # Pass copies of state to ensure thread safety
             atr_ratios_map = {p['symbol']: self.atr_window.get_atr_ratio_for_symbol(p['symbol']) for p in enriched_positions}
             
             calculator = PortfolioCalculator(
-                self.atr_window.atr_state, # Use direct reference, not a copy
+                updated_atr_state, # Use the state just calculated by the processor
                 {}, # user_overrides is no longer used
                 self.highest_stop_losses, # Pass the direct reference, not a copy
                 atr_ratios_map,
@@ -255,6 +257,11 @@ class SettingsWindow(QDialog):
         self.trading_mode_combo.setCurrentText(parent.trading_mode)
         form_layout.addRow("Trading Mode:", self.trading_mode_combo)
 
+        # Debug Log setting
+        self.debug_log_check = QCheckBox()
+        self.debug_log_check.setChecked(parent.debug_log_enabled)
+        form_layout.addRow("Debug Log:", self.debug_log_check)
+
         layout.addLayout(form_layout)
 
         # OK and Cancel buttons
@@ -274,6 +281,7 @@ class ATRWindow(QMainWindow):
         self.positions_data = [] # This will hold the fully processed data from the worker
         self.contract_details_map = {}  # Store contract details by symbol
         self.symbol_stop_enabled = {}  # {symbol: bool} to track individual stop toggles
+        self.symbol_candle_size = {} # {symbol: "1 day"|"1 hour"|"15 mins"}
         self.atr_ratios = {} # {symbol: float} to store user-set ATR ratios from the UI
 
         # ATR calculation data
@@ -298,6 +306,7 @@ class ATRWindow(QMainWindow):
         # Set a default client_id before loading settings
         self.client_id = 1000 
         self.trading_mode = "PAPER" # Default trading mode
+        self.debug_log_enabled = False # Default debug log
         self.user_settings_file = os.path.join(USER_DATA_DIR, USER_SETTINGS_FILE)
         # Load settings, which will update client_id if it exists in the file
         self.load_user_settings()
@@ -407,15 +416,18 @@ class ATRWindow(QMainWindow):
         layout.addWidget(self.tabs)
 
         # --- Terminal/Log View ---
-        log_label = QLabel("Log Output:")
-        log_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        layout.addWidget(log_label)
+        self.log_label = QLabel("Log Output:")
+        self.log_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(self.log_label)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         # A simple dark theme for the log view
         self.log_view.setStyleSheet("background-color: #2B2B2B; color: #A9B7C6; font-family: 'Courier New';")
         self.log_view.setMaximumHeight(200) # Give it a fixed max height
         layout.addWidget(self.log_view)
+
+        # Set initial visibility based on settings
+        self.update_log_visibility()
 
         # --- Positions Table Tab ---
         self.positions_tab = QWidget()
@@ -426,16 +438,27 @@ class ATRWindow(QMainWindow):
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("QTableWidget { background-color: black; alternate-background-color: #111111; }")
-        self.table.setColumnCount(13)
+        self.table.setColumnCount(14)
         self.table.setHorizontalHeaderLabels([
-            "Send", "Position", "ATR", "ATR Ratio", "Positions Held", "Margin", "Avg Cost",
+            "Send", "Position", "Candle", "ATR", "ATR Ratio", "Positions Held", "Margin", "Avg Cost",
             "Current Price", "Computed Stop Loss", "", "$ Risk", "% Risk", "Status"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(13, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionsMovable(True)
-        self.table.setColumnWidth(0, 50) # "Send" column
-        self.table.setColumnWidth(9, 50) # Ratchet status column
+        
+        # Apply saved column widths if available, otherwise use defaults
+        if self.column_widths:
+            for col_idx, width in self.column_widths.items():
+                try:
+                    self.table.setColumnWidth(int(col_idx), int(width))
+                except (ValueError, TypeError):
+                    pass
+        else:
+            self.table.setColumnWidth(0, 50) # "Send" column
+            self.table.setColumnWidth(2, 80) # Candle column
+            self.table.setColumnWidth(10, 50) # Ratchet status column
+            
         self.table.setSortingEnabled(True)
         self.positions_layout.addWidget(self.table)
 
@@ -464,13 +487,24 @@ class ATRWindow(QMainWindow):
         graph_controls_widget = QWidget()
         graph_controls_layout = QHBoxLayout(graph_controls_widget)
         graph_controls_layout.setContentsMargins(0, 0, 0, 0)
+        graph_controls_layout.setSpacing(5)
         
         self.symbol_selector = QComboBox()
         self.symbol_selector.setMinimumWidth(150)
         self.symbol_selector.currentIndexChanged.connect(self.update_atr_graph)
         graph_controls_layout.addWidget(QLabel("Symbol:"))
         graph_controls_layout.addWidget(self.symbol_selector)
-        graph_controls_layout.addStretch() # Push controls to the left
+
+        # Add a button to reset the graph view to the most recent data
+        self.reset_view_button = QPushButton()
+        # Use a "reset" icon, as a standard crosshair is not available.
+        reset_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton)
+        self.reset_view_button.setIcon(reset_icon)
+        self.reset_view_button.setToolTip("Reset view to show the most recent data")
+        self.reset_view_button.setFixedSize(28, 28)
+        self.reset_view_button.clicked.connect(self.update_atr_graph) # Re-running update_atr_graph resets the view
+        graph_controls_layout.addWidget(self.reset_view_button)
+        graph_controls_layout.addStretch() # Push remaining controls to the left
 
         self.graphing_layout.addWidget(graph_controls_widget)
 
@@ -512,28 +546,86 @@ class ATRWindow(QMainWindow):
         """Updates the ATR graph based on the selected symbol."""
         symbol = self.symbol_selector.currentText()
         self.atr_plot.clear()
-        self.atr_plot.setTitle(f"ATR History for {symbol}")
+        
+        # Reset ViewBox limits to defaults to prevent carry-over between symbols
+        view_box = self.atr_plot.plotItem.getViewBox()
+        view_box.setLimits(xMin=None, xMax=None, yMin=None, yMax=None,
+                           minXRange=None, maxXRange=None, minYRange=None, maxYRange=None)
+
+        if not symbol or symbol not in self.atr_history:
+            self.atr_plot.setTitle(f"ATR History for {symbol}")
+            return
+
+        # Get the candle size setting for this symbol to plot the correct data
+        candle_size = self.get_candle_size(symbol)
+        self.atr_plot.setTitle(f"ATR History for {symbol} ({candle_size})")
         self.atr_plot.setLabel('left', 'ATR Value')
         self.atr_plot.setLabel('bottom', 'Time')
         self.atr_plot.showGrid(x=True, y=True)
 
-        if not symbol or symbol not in self.atr_history:
-            return
-
-        # Plot the ATR history, not the TR history from the state file.
-        symbol_data = self.atr_history.get(symbol, {})
-        if not symbol_data:
+        # The data is now nested: symbol -> candle_size -> {timestamp: atr}
+        symbol_candle_data = self.atr_history.get(symbol, {}).get(candle_size, {})
+        if not symbol_candle_data:
             return
 
         # Sort data by timestamp and prepare for plotting
-        sorted_timestamps = sorted(symbol_data.keys()) # Timestamps are ISO strings
+        valid_timestamps = [ts for ts in symbol_candle_data.keys() if 'T' in ts]
+        sorted_timestamps = sorted(valid_timestamps)
         x_data = [datetime.fromisoformat(ts).timestamp() for ts in sorted_timestamps]
-        y_data = [symbol_data[ts] for ts in sorted_timestamps]
+        y_data = [symbol_candle_data[ts] for ts in sorted_timestamps]
 
-        self.atr_plot.getAxis('bottom').setTickSpacing(3600, 1800) # Major tick every hour, minor every 30 mins
-        self.atr_plot.getAxis('bottom').setStyle(tickTextOffset = 10, autoExpandTextSpace=True)
-        self.atr_plot.setAxisItems({'bottom': pg.DateAxisItem()})
+        if not y_data:
+            return
+
+        # --- Y-Axis Scaling ---
+        max_atr = max(y_data)
+        # Limit Y zoom to 3x the max ATR value.
+        # yMin=0 ensures we don't see negative ATR.
+        # maxYRange ensures we don't zoom out past 3x max_atr.
+        view_box.setLimits(yMin=0, maxYRange=max_atr * 3)
+        view_box.setYRange(0, max_atr * 3, padding=0)
+
+        # --- X-Axis Scaling ---
+        seconds_in_day = 86400
+        max_x_span = None
+        
+        if candle_size == "15 mins":
+            max_x_span = 3 * seconds_in_day
+        elif candle_size == "1 hour":
+            max_x_span = 7 * seconds_in_day
+        elif candle_size == "1 day":
+            max_x_span = 30 * seconds_in_day
+            
+        if max_x_span:
+            view_box.setLimits(maxXRange=max_x_span)
+            # Set initial view to the most recent data within the span
+            if x_data:
+                last_ts = x_data[-1]
+                half_span = max_x_span / 2
+                view_box.setXRange(last_ts - half_span, last_ts + half_span, padding=0)
+
+        # Create and configure the DateAxisItem for the bottom axis
+        axis = pg.DateAxisItem()
+        axis.setStyle(tickTextOffset=10, autoExpandTextSpace=True)
+
+        # Set tick spacing based on the candle size for clarity
+        if candle_size == "1 day":
+            # 3M view: Major ticks per week, minor per day
+            axis.setTickSpacing(86400 * 7, 86400)
+        elif candle_size == "1 hour":
+            # 1W view: Major ticks per day, minor per 6 hours
+            axis.setTickSpacing(86400, 3600 * 6)
+        elif candle_size == "15 mins":
+            # 2D view: Major ticks per 4 hours, minor per hour
+            axis.setTickSpacing(3600 * 4, 3600)
+
+        self.atr_plot.plotItem.setAxisItems({'bottom': axis})
         self.atr_plot.plot(x_data, y_data, pen=pg.mkPen('y', width=2), symbol='o', symbolBrush='y', symbolSize=5)
+
+    def update_log_visibility(self):
+        """Updates the visibility of the log view based on the setting."""
+        self.log_label.setVisible(self.debug_log_enabled)
+        self.log_view.setVisible(self.debug_log_enabled)
 
     def open_settings_window(self):
         """Opens the settings dialog window."""
@@ -553,6 +645,11 @@ class ATRWindow(QMainWindow):
                     self.trading_mode = new_trading_mode
                     self.log_to_ui(f"Trading Mode set to {self.trading_mode}. Changes will apply on next refresh.")
                     self.trading_mode_label.setText(f"Mode: {self.trading_mode}")
+
+                # Update Debug Log
+                if self.debug_log_enabled != dialog.debug_log_check.isChecked():
+                    self.debug_log_enabled = dialog.debug_log_check.isChecked()
+                    self.update_log_visibility()
 
                 self.save_user_settings() # Save all settings at once
             except ValueError:
@@ -629,18 +726,30 @@ class ATRWindow(QMainWindow):
                 position_item.setIcon(icon)
                 self.table.setItem(i, 1, position_item)
                 
-                # Column 2: ATR - Get ATR value from ATR calculations tab
+                # Column 2: Candle Size
+                candle_options = ["15 mins", "1 hour", "1 day"]
+                current_candle = self.get_candle_size(symbol)
+                
+                combo = QComboBox()
+                combo.addItems(candle_options)
+                combo.blockSignals(True)
+                combo.setCurrentText(current_candle)
+                combo.blockSignals(False)
+                combo.currentTextChanged.connect(lambda text, s=symbol: self.on_candle_size_changed(s, text))
+                self.table.setCellWidget(i, 2, combo)
+
+                # Column 3: ATR - Get ATR value from ATR calculations tab
                 atr_value = p_data.get('atr_value')
                 atr_display = f"{atr_value:.4f}" if atr_value is not None else "N/A"
                 item_2 = NumericTableWidgetItem(atr_display)
                 item_2.setData(Qt.ItemDataRole.UserRole, atr_value if atr_value is not None else -1.0)
-                self.table.setItem(i, 2, item_2)
+                self.table.setItem(i, 3, item_2)
 
-                # Column 3: ATR Ratio editable spin box
+                # Column 4: ATR Ratio editable spin box
                 ratio_val = p_data.get('atr_ratio', 1.5)
                 item_3 = NumericTableWidgetItem()
                 item_3.setData(Qt.ItemDataRole.UserRole, ratio_val)
-                self.table.setItem(i, 3, item_3)
+                self.table.setItem(i, 4, item_3)
 
                 spin = QDoubleSpinBox()
                 spin.setMinimum(0.1)
@@ -650,40 +759,40 @@ class ATRWindow(QMainWindow):
                 spin.setValue(ratio_val)
                 spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
                 spin.valueChanged.connect(lambda val, row=i, symbol=symbol: self.on_atr_ratio_changed(row, symbol, val))
-                self.table.setCellWidget(i, 3, spin)
+                self.table.setCellWidget(i, 4, spin)
 
-                # Column 4: Positions Held
+                # Column 5: Positions Held
                 pos_held = p_data['positions_held']
                 item_4 = NumericTableWidgetItem(str(pos_held))
                 item_4.setData(Qt.ItemDataRole.UserRole, pos_held)
-                self.table.setItem(i, 4, item_4)
+                self.table.setItem(i, 5, item_4)
                 
-                # Column 5: Margin
+                # Column 6: Margin
                 margin = p_data.get('margin', 0)
                 item_5 = NumericTableWidgetItem(f"${margin:,.2f}")
                 item_5.setData(Qt.ItemDataRole.UserRole, margin)
-                self.table.setItem(i, 5, item_5)
+                self.table.setItem(i, 6, item_5)
 
-                # Column 6: Avg Cost
+                # Column 7: Avg Cost
                 avg_cost = p_data.get('avg_cost', 0.0)
                 item_6 = NumericTableWidgetItem(f"{avg_cost:,.2f}")
                 item_6.setData(Qt.ItemDataRole.UserRole, avg_cost)
-                self.table.setItem(i, 6, item_6)
+                self.table.setItem(i, 7, item_6)
 
-                # Column 7: Current Price
+                # Column 8: Current Price
                 price = p_data.get('current_price', 0)
                 item_7 = NumericTableWidgetItem(f"{price:.2f}")
                 item_7.setData(Qt.ItemDataRole.UserRole, price)
-                self.table.setItem(i, 7, item_7)
+                self.table.setItem(i, 8, item_7)
 
-                # Column 8: Computed Stop Loss
+                # Column 9: Computed Stop Loss
                 computed_stop = p_data.get('computed_stop_loss')
                 stop_display = f"{computed_stop:.4f}" if computed_stop is not None else "N/A"
                 item_8 = NumericTableWidgetItem(stop_display)
                 item_8.setData(Qt.ItemDataRole.UserRole, computed_stop if computed_stop is not None else -1.0)
-                self.table.setItem(i, 8, item_8)
+                self.table.setItem(i, 9, item_8)
 
-                # Column 9: Stop Status Icon (New)
+                # Column 10: Stop Status Icon (New)
                 stop_status = p_data.get('stop_status', 'new') # Default to 'new'
                 status_item = QTableWidgetItem()
                 status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -697,9 +806,9 @@ class ATRWindow(QMainWindow):
                     status_item.setForeground(QColor('orange'))
                     status_item.setToolTip("Stop loss held by ratchet (previous stop was higher).")
 
-                self.table.setItem(i, 9, status_item)
+                self.table.setItem(i, 10, status_item)
 
-                # Column 10: $ Risk
+                # Column 11: $ Risk
                 risk_value = p_data.get('dollar_risk', 0)
                 if risk_value == "NO RISK":
                     item_10 = NumericTableWidgetItem("NO RISK")
@@ -710,19 +819,19 @@ class ATRWindow(QMainWindow):
                     item_10 = NumericTableWidgetItem(f"${risk_value:,.2f}")
                     item_10.setData(Qt.ItemDataRole.UserRole, risk_value)
                 
-                self.table.setItem(i, 10, item_10)
+                self.table.setItem(i, 11, item_10)
 
-                # Column 11: % Risk
+                # Column 12: % Risk
                 percent_risk = p_data.get('percent_risk', 0.0)
                 item_11 = NumericTableWidgetItem(f"{percent_risk:.2f}%")
                 item_11.setData(Qt.ItemDataRole.UserRole, percent_risk)
 
                 if percent_risk > 2.0:
                     item_11.setForeground(QColor('red'))
-                self.table.setItem(i, 11, item_11)
+                self.table.setItem(i, 12, item_11)
 
-                # Column 12: Status
-                self.table.setItem(i, 12, QTableWidgetItem(p_data.get('status', '...')))
+                # Column 13: Status
+                self.table.setItem(i, 13, QTableWidgetItem(p_data.get('status', '...')))
 
             except Exception as e:
                 symbol = p_data.get('symbol', 'UNKNOWN')
@@ -777,9 +886,9 @@ class ATRWindow(QMainWindow):
         new_risk_dollar, new_risk_percent = calculator.calculate_risk(p_data, new_stop)
 
         # Update the UI with the new values
-        self.table.item(row, 8).setText(f"{new_stop:.4f}" if new_stop is not None and isinstance(new_stop, (int, float)) else "N/A")
+        self.table.item(row, 9).setText(f"{new_stop:.4f}" if new_stop is not None and isinstance(new_stop, (int, float)) else "N/A")
         
-        item_10 = self.table.item(row, 10)
+        item_10 = self.table.item(row, 11)
         if new_risk_dollar == "NO RISK":
             item_10.setText("NO RISK")
             item_10.setData(Qt.ItemDataRole.UserRole, 0)
@@ -791,7 +900,7 @@ class ATRWindow(QMainWindow):
             item_10.setData(Qt.ItemDataRole.BackgroundRole, None)
             item_10.setData(Qt.ItemDataRole.ForegroundRole, None)
             
-        self.table.item(row, 11).setText(f"{new_risk_percent:.2f}%")
+        self.table.item(row, 12).setText(f"{new_risk_percent:.2f}%")
 
     def get_atr_ratio_for_symbol(self, symbol):
         """Finds the ATR ratio for a symbol from the UI table."""
@@ -807,28 +916,78 @@ class ATRWindow(QMainWindow):
                     # Load client_id, defaulting to the pre-set value if not in file
                     self.client_id = settings.get('client_id', self.client_id)
                     self.trading_mode = settings.get('trading_mode', self.trading_mode)
+                    self.debug_log_enabled = settings.get('debug_log_enabled', False)
                     # Load symbol toggles
                     self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
+                    self.symbol_candle_size = settings.get('symbol_candle_size', {})
+                    self.column_widths = settings.get('column_widths', {})
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Error loading user settings: {e}")
                 self.symbol_stop_enabled = {}
+                self.symbol_candle_size = {}
+                self.column_widths = {}
         else:
             self.symbol_stop_enabled = {}
+            self.symbol_candle_size = {}
+            self.column_widths = {}
 
     def save_user_settings(self):
         """Save all user settings to user_settings.json"""
         try:
+            # Capture current column widths if table exists
+            if hasattr(self, 'table'):
+                current_widths = {}
+                for i in range(self.table.columnCount()):
+                    current_widths[str(i)] = self.table.columnWidth(i)
+                self.column_widths = current_widths
+
             with open(self.user_settings_file, 'w') as f:
                 settings_to_save = {
                     'client_id': self.client_id,
                     'trading_mode': self.trading_mode,
+                    'debug_log_enabled': self.debug_log_enabled,
                     'symbol_stop_enabled': self.symbol_stop_enabled,
+                    'symbol_candle_size': self.symbol_candle_size,
+                    'column_widths': self.column_widths,
                     # Add any other settings here in the future
                 }
                 json.dump(settings_to_save, f, indent=2)
             logging.info("User settings saved successfully")
         except Exception as e:
             print(f"Error saving user settings: {e}")
+
+    def get_candle_size(self, symbol):
+        return self.symbol_candle_size.get(symbol, "1 day")
+
+    def set_candle_size(self, symbol, size):
+        self.symbol_candle_size[symbol] = size
+        self.save_user_settings()
+
+    def get_all_candle_sizes(self):
+        return self.symbol_candle_size
+
+    def on_candle_size_changed(self, symbol, new_size):
+        current_size = self.get_candle_size(symbol)
+        if current_size == new_size:
+            return
+
+        logging.info(f"Candle size for {symbol} changed from {current_size} to {new_size}. Wiping history.")
+        self.set_candle_size(symbol, new_size)
+
+        # Wipe ATR state and history to force re-initialization
+        if symbol in self.atr_state:
+            del self.atr_state[symbol]
+            self.save_atr_state()
+        
+        if symbol in self.atr_history:
+            del self.atr_history[symbol]
+            self.save_atr_history()
+            
+        self.log_to_ui(f"History wiped for {symbol} due to timeframe change. ATR will re-initialize.")
+        
+        # Refresh graph if needed
+        if self.symbol_selector.currentText() == symbol:
+            self.update_atr_graph()
 
     def on_symbol_toggle_changed(self, symbol, state):
         """Handles when a user toggles the checkbox for an individual symbol."""
@@ -879,6 +1038,9 @@ class ATRWindow(QMainWindow):
             try:
                 with open(self.stop_history_file, 'r') as f:
                     history = json.load(f)
+                    if not isinstance(history, dict):
+                        logging.warning(f"Stop history file is corrupt (not a dictionary). Ignoring. Path: {self.stop_history_file}")
+                        return {}
                     logging.info(f"Loaded {len(history)} symbols from stop history.")
                     return history
             except (json.JSONDecodeError, IOError) as e:
@@ -930,12 +1092,13 @@ class ATRWindow(QMainWindow):
     
     def save_atr_state(self):
         """Save ATR state to JSON file"""
-        try:
-            with open(self.atr_state_file, 'w') as f:
-                json.dump(self.atr_state, f, indent=2)
-            logging.info("ATR state saved successfully")
-        except Exception as e:
-            print(f"Error saving ATR state: {e}")
+        with self.atr_state_file_lock:
+            try:
+                with open(self.atr_state_file, 'w') as f:
+                    json.dump(self.atr_state, f, indent=2)
+                logging.info("ATR state saved successfully")
+            except Exception as e:
+                print(f"Error saving ATR state: {e}")
 
     def start_full_refresh(self):
         """Starts the first stage of the data loading sequence."""
