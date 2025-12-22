@@ -29,62 +29,69 @@ class PortfolioCalculator:
             return self.highest_stop_losses.get(symbol, 0), 'held'
 
         quantity = position_data.get('positions_held', 0)
-        is_long = quantity > 0
-
-        if is_long:
-            raw_stop = current_price - (atr_value * atr_ratio)
-        else:
-            # For short positions, stop is above the current price
-            raw_stop = current_price + (atr_value * atr_ratio)
-
         contract_details = position_data.get('contract_details', {})
-        min_tick = contract_details.get('minTick')
+        
+        if quantity > 0:
+            return self._compute_long_ratchet(symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet)
+        elif quantity < 0:
+            return self._compute_short_ratchet(symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet)
+        else:
+            return 0.0, 'held'
 
-        final_stop = float(raw_stop)
-        if min_tick and min_tick > 0 and quantity != 0:
-            raw_stop_decimal = Decimal(str(raw_stop))
+    def _round_price(self, price, contract_details, is_long):
+        """Rounds the price according to minTick and direction."""
+        min_tick = contract_details.get('minTick')
+        if min_tick and min_tick > 0:
+            price_decimal = Decimal(str(price))
             min_tick_decimal = Decimal(str(min_tick))
             
             # Round down for long positions (SELL stop) to keep stop away from price (lower).
             # Round up for short positions (BUY stop) to keep stop away from price (higher).
             rounding_mode = ROUND_DOWN if is_long else ROUND_UP
             
-            rounded_stop_decimal = (raw_stop_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=rounding_mode) * min_tick_decimal
-            final_stop = float(rounded_stop_decimal)
-            logging.debug(f"Rounding for {symbol}: raw={raw_stop}, minTick={min_tick}, final={final_stop}")
+            rounded_decimal = (price_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=rounding_mode) * min_tick_decimal
+            return float(rounded_decimal)
+        return float(price)
+
+    def _compute_long_ratchet(self, symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet):
+        raw_stop = current_price - (atr_value * atr_ratio)
+        final_stop = self._round_price(raw_stop, contract_details, is_long=True)
         
-        # Check if a ratchet value exists for this symbol.
-        # The presence of a key in highest_stop_losses indicates an active, tracked position.
-        is_new_position = symbol not in self.highest_stop_losses
-        
-        if apply_ratchet:
-            # If this is a brand new position, establish the first stop and treat it as 'new'.
-            if is_new_position:
-                self.highest_stop_losses[symbol] = final_stop
-                return final_stop, 'new'
-            
-            # If it's an existing position, apply ratcheting logic.
-            if is_long:
-                prev_highest = self.highest_stop_losses.get(symbol, 0)
-                # New stop must be higher than previous highest
-                if final_stop > prev_highest:
-                    self.highest_stop_losses[symbol] = final_stop
-                    return final_stop, 'new'
-                else:
-                    # The calculated stop is not an improvement, so we hold the previous highest.
-                    return prev_highest, 'held'
-            else: # is_short
-                # For short positions, an "improving" stop is a lower price.
-                prev_highest_short = self.highest_stop_losses.get(symbol, float('inf'))
-                if final_stop < prev_highest_short:
-                    self.highest_stop_losses[symbol] = final_stop
-                    return final_stop, 'new'
-                else:
-                    # The calculated stop is not an improvement, so we hold the previous highest.
-                    return prev_highest_short, 'held'
-        else:
-            # If not ratcheting, it's always considered 'new' for UI feedback purposes
+        if not apply_ratchet:
             return final_stop, 'new'
+            
+        is_new_position = symbol not in self.highest_stop_losses
+        if is_new_position:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+            
+        prev_highest = self.highest_stop_losses.get(symbol, 0)
+        if final_stop > prev_highest:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+        else:
+            return prev_highest, 'held'
+
+    def _compute_short_ratchet(self, symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet):
+        raw_stop = current_price + (atr_value * atr_ratio)
+        final_stop = self._round_price(raw_stop, contract_details, is_long=False)
+        
+        if not apply_ratchet:
+            return final_stop, 'new'
+            
+        is_new_position = symbol not in self.highest_stop_losses
+        if is_new_position:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+            
+        # For shorts, the stop moves DOWN. We want the minimum value seen so far.
+        prev_lowest = self.highest_stop_losses.get(symbol, float('inf'))
+        
+        if final_stop < prev_lowest:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+        else:
+            return prev_lowest, 'held'
 
     def calculate_risk(self, position_data, computed_stop):
         """Calculates the dollar and percentage risk for a position."""
