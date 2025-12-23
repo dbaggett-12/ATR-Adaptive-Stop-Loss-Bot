@@ -7,7 +7,7 @@ import logging
 import pytz
 import math
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from utils import get_point_value
+from utils import get_point_value, get_corrected_min_tick
 
 def fetch_positions():
     """
@@ -493,7 +493,10 @@ async def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) ->
         # Update contract details with minTick
         cd = contract_details_objects.get(symbol)
         if cd:
-            p_data['contract_details']['minTick'] = cd.minTick or 0.01 # Default to 0.01 if None
+            raw_min_tick = cd.minTick if cd.minTick else 0.01
+            # Apply correction for cents vs dollars discrepancies
+            p_data['contract_details']['minTick'] = get_corrected_min_tick(symbol, raw_min_tick)
+            
             # Capture the price magnifier, which is crucial for contracts priced in cents.
             p_data['contract_details']['priceMagnifier'] = int(cd.priceMagnifier) if cd.priceMagnifier else 1
             # Capture the mdSizeMultiplier, which often represents the point value or contract size.

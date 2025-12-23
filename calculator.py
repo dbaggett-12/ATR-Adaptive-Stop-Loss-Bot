@@ -42,11 +42,6 @@ class PortfolioCalculator:
         """Rounds the price according to minTick and direction."""
         min_tick = contract_details.get('minTick')
 
-        if symbol == 'MZL':
-            min_tick = 0.02
-        elif symbol in ['MZW', 'MZS']:
-            min_tick = 0.5
-
         if min_tick and min_tick > 0:
             price_decimal = Decimal(str(price))
             min_tick_decimal = Decimal(str(min_tick))

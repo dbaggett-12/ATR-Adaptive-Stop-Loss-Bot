@@ -17,6 +17,7 @@ CONTRACT_POINT_VALUES = {
     'MNQ': 2.0,      # Micro E-mini Nasdaq: $2 per point
     'MYM': 0.50,     # Micro E-mini Dow: $0.50 per point
     'M2K': 5.0,      # Micro E-mini Russell 2000: $5 per point
+    'VXM': 100.0,    # Micro VIX: $100 per point
     
     # Treasury Futures
     'ZN': 1000.0,    # 10-Year T-Note: $1000 per point
@@ -82,8 +83,17 @@ CONTRACT_POINT_VALUES = {
     
     # Micro Currency Futures
     'M6E': 12500.0,  # Micro Euro: 12500 EUR × $1.00 = $12500 per point
+    'M6B': 6250.0,   # Micro British Pound: 6250 GBP × $1.00 = $6250 per point
+    'MCD': 10000.0,  # Micro Canadian Dollar: 10000 CAD × $1.00 = $10000 per point
 }
 
+def update_contract_point_value(symbol, point_value):
+    """
+    Updates the CONTRACT_POINT_VALUES dictionary with a new symbol and point value
+    if it doesn't already exist.
+    """
+    if symbol not in CONTRACT_POINT_VALUES:
+        CONTRACT_POINT_VALUES[symbol] = point_value
 
 def get_point_value(symbol, contract_details, multiplier):
     """
@@ -110,14 +120,54 @@ def get_point_value(symbol, contract_details, multiplier):
     if price_magnifier > 1 and md_size_multiplier is not None:
         point_value = float(md_size_multiplier) / price_magnifier
         logging.warning(f"Unknown contract {symbol}. Derived point value: ${point_value:.2f} (mdSizeMultiplier={md_size_multiplier}, priceMagnifier={price_magnifier}). Consider adding to CONTRACT_POINT_VALUES.")
+        update_contract_point_value(symbol, point_value)
         return point_value
     
     elif md_size_multiplier is not None and md_size_multiplier > 1:
         point_value = float(md_size_multiplier)
         logging.warning(f"Unknown contract {symbol}. Using mdSizeMultiplier as point value: ${point_value:.2f}. Consider adding to CONTRACT_POINT_VALUES.")
+        update_contract_point_value(symbol, point_value)
         return point_value
     
     else:
         point_value = multiplier if multiplier > 0 else 1.0
         logging.warning(f"Unknown contract {symbol}. Using multiplier as point value: ${point_value:.2f}. Consider adding to CONTRACT_POINT_VALUES.")
+        update_contract_point_value(symbol, point_value)
         return point_value
+
+# --- MinTick Correction Logic ---
+
+# Symbols that are quoted in cents (or similar units) where IBKR might return minTick in dollars
+# requiring a x100 correction if the value is small.
+QUOTED_IN_CENTS = {
+    'ZC', 'ZS', 'ZW', 'ZL', 'HE', 'LE', 'GF', # Standard Ags
+    'MZC', 'MZS', 'MZW', 'MZL',               # Micro Ags (excluding MZM which is $/ton)
+    'HG', 'MHG'                               # Copper
+}
+
+# Explicit overrides for minTick values where API data is known to be problematic
+MIN_TICK_OVERRIDES = {
+    'MZL': 0.2, # Explicit requirement: Micro Soybean Oil orders need 0.2 multiples
+}
+
+def get_corrected_min_tick(symbol, raw_min_tick):
+    """
+    Returns the corrected minTick, handling overrides and cents vs dollars discrepancies.
+    """
+    # 1. Check explicit overrides first
+    if symbol in MIN_TICK_OVERRIDES:
+        return MIN_TICK_OVERRIDES[symbol]
+    
+    if raw_min_tick is None or raw_min_tick <= 0:
+        return 0.01
+        
+    # 2. Logic for symbols quoted in cents (e.g. Corn, Soybean Oil)
+    # If IBKR returns a minTick that looks like dollars (e.g. 0.0025), 
+    # but the price is in cents (e.g. 450.25), we need to scale up by 100.
+    if symbol in QUOTED_IN_CENTS:
+        # Threshold: 0.0099. ZL (Soybean Oil) tick is 0.01, so we preserve that.
+        # If raw_tick is < 0.0099 (e.g. 0.002), it's likely in dollars -> scale by 100.
+        if raw_min_tick < 0.0099:
+            return raw_min_tick * 100.0
+            
+    return raw_min_tick

@@ -64,7 +64,7 @@
  [],
  False,
  False,
- 1766365260,
+ 1766453206,
  [('runw',
    '/Users/kenickie/Documents/atrTrailingStop/venv/lib/python3.13/site-packages/PyInstaller/bootloader/Darwin-64bit/runw',
    'EXECUTABLE')],
