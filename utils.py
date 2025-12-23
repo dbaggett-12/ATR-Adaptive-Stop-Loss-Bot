@@ -64,8 +64,8 @@ CONTRACT_POINT_VALUES = {
     # Energy
     'CL': 1000.0,    # Crude Oil: 1000 barrels × $1.00 = $1000 per point
     'NG': 10000.0,   # Natural Gas: 10000 MMBtu × $1.00 = $10000 per point
-    'RB': 420.0,     # RBOB Gasoline: 42000 gallons × $0.01 = $420 per 1 cent
-    'HO': 420.0,     # Heating Oil: 42000 gallons × $0.01 = $420 per 1 cent
+    'RB': 42000.0,   # RBOB Gasoline: 42000 gallons × $1.00 = $42000 per point
+    'HO': 42000.0,   # Heating Oil: 42000 gallons × $1.00 = $42000 per point
     
     # Micro Energy
     'QM': 500.0,     # E-mini Crude Oil: 500 barrels x $1.00 = $500 per point
@@ -109,6 +109,11 @@ def get_point_value(symbol, contract_details, multiplier):
     Returns:
         float: Dollar value per 1.00 price move
     """
+    # 1. Dynamic: Trust the API multiplier if it's a specific value (not default 1.0)
+    # This ensures that if IBKR says RB multiplier is 42000, we use 42000.
+    if multiplier and multiplier > 0 and multiplier != 1.0:
+        return multiplier
+
     # First, check the explicit metadata dictionary
     if symbol in CONTRACT_POINT_VALUES:
         return CONTRACT_POINT_VALUES[symbol]
@@ -142,7 +147,6 @@ def get_point_value(symbol, contract_details, multiplier):
 QUOTED_IN_CENTS = {
     'ZC', 'ZS', 'ZW', 'ZL', 'HE', 'LE', 'GF', # Standard Ags
     'MZC', 'MZS', 'MZW', 'MZL',               # Micro Ags (excluding MZM which is $/ton)
-    'HG', 'MHG'                               # Copper
 }
 
 # Explicit overrides for minTick values where API data is known to be problematic

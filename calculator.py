@@ -98,9 +98,10 @@ class PortfolioCalculator:
         """Calculates the dollar and percentage risk for a position."""
         avg_cost = position_data.get('avg_cost', 0)
         quantity = position_data.get('positions_held', 0)
+        current_price = position_data.get('current_price', 0)
 
         # If there's no valid stop, cost, or position, there's no risk to calculate.
-        if computed_stop is None or avg_cost <= 0 or quantity == 0:
+        if computed_stop is None or avg_cost <= 0 or quantity == 0 or current_price <= 0:
             return 0, 0.0
 
         is_long = quantity > 0
@@ -109,14 +110,14 @@ class PortfolioCalculator:
         if is_long:
             # For a long position, risk exists if the stop is below the entry price.
             if computed_stop < avg_cost:
-                risk_in_points = avg_cost - computed_stop
+                risk_in_points = abs(current_price - computed_stop)
             else:
                 # Stop is at or above entry price, so there is no risk.
                 return "NO RISK", 0.0
         else:  # is_short
             # For a short position, risk exists if the stop is above the entry price.
             if computed_stop > avg_cost:
-                risk_in_points = computed_stop - avg_cost
+                risk_in_points = abs(current_price - computed_stop)
             else:
                 # Stop is at or below entry price, so there is no risk.
                 return "NO RISK", 0.0

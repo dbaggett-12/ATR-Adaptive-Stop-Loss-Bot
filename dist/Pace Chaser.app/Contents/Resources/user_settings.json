@@ -1,0 +1,18 @@
+{
+  "client_id": 1000,
+  "trading_mode": "PAPER",
+  "symbol_stop_enabled": {
+    "MES": true,
+    "MHG": true,
+    "MGC": true,
+    "MYM": true,
+    "QG": true,
+    "M2K": true,
+    "MCL": true
+  },
+  "symbol_candle_size": {
+    "MES": "1 day",
+    "MHG": "1 hour",
+    "QG": "15 mins"
+  }
+}
