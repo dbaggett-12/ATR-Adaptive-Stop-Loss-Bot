@@ -38,9 +38,15 @@ class PortfolioCalculator:
         else:
             return 0.0, 'held'
 
-    def _round_price(self, price, contract_details, is_long):
+    def _round_price(self, price, contract_details, is_long, symbol=None):
         """Rounds the price according to minTick and direction."""
         min_tick = contract_details.get('minTick')
+
+        if symbol == 'MZL':
+            min_tick = 0.02
+        elif symbol in ['MZW', 'MZS']:
+            min_tick = 0.5
+
         if min_tick and min_tick > 0:
             price_decimal = Decimal(str(price))
             min_tick_decimal = Decimal(str(min_tick))
@@ -55,7 +61,7 @@ class PortfolioCalculator:
 
     def _compute_long_ratchet(self, symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet):
         raw_stop = current_price - (atr_value * atr_ratio)
-        final_stop = self._round_price(raw_stop, contract_details, is_long=True)
+        final_stop = self._round_price(raw_stop, contract_details, is_long=True, symbol=symbol)
         
         if not apply_ratchet:
             return final_stop, 'new'
@@ -74,7 +80,7 @@ class PortfolioCalculator:
 
     def _compute_short_ratchet(self, symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet):
         raw_stop = current_price + (atr_value * atr_ratio)
-        final_stop = self._round_price(raw_stop, contract_details, is_long=False)
+        final_stop = self._round_price(raw_stop, contract_details, is_long=False, symbol=symbol)
         
         if not apply_ratchet:
             return final_stop, 'new'

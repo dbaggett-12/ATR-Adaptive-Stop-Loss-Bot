@@ -7,8 +7,6 @@ datas = [
     ('user_settings.json', '.'),
     ('tr_history.json', '.'),
     ('stop_history.json', '.'),
-    ('atr_state.json', '.'),
-    ('atr_history.json', '.'),
 ]
 
 hiddenimports = []

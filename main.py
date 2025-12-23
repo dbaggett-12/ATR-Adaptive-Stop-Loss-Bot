@@ -104,7 +104,7 @@ class DataWorker(QObject):
         try:
             # Determine port based on trading mode
             port = 7496 if self.atr_window.trading_mode == 'LIVE' else 7497
-            self.log_message.emit(f"Connecting in {self.atr_window.trading_mode} mode on port {port}...")
+            # self.log_message.emit(f"Connecting in {self.atr_window.trading_mode} mode on port {port}...")
             await ib.connectAsync('127.0.0.1', port, clientId=self.client_id)
             
             # --- CRITICAL RECONCILIATION STEP ---
@@ -115,7 +115,7 @@ class DataWorker(QObject):
             # history if it does NOT have an active stop order in the brokerage.
             symbols_to_clear = set(self.highest_stop_losses.keys()) - active_stop_symbols
             if symbols_to_clear:
-                self.log_message.emit(f"Reconciliation: Clearing stale ratchet history for: {', '.join(symbols_to_clear)}")
+                # self.log_message.emit(f"Reconciliation: Clearing stale ratchet history for: {', '.join(symbols_to_clear)}")
                 for symbol in symbols_to_clear:
                     del self.highest_stop_losses[symbol]
             # --- END RECONCILIATION ---
@@ -127,6 +127,13 @@ class DataWorker(QObject):
             
             # --- Stage 2: Fetch Market Data ---
             enriched_positions = await fetch_market_data_for_positions(ib, basic_positions)
+            
+            # --- Debug: Log API minTick ---
+            self.log_message.emit("--- API minTick Values ---")
+            for p in enriched_positions:
+                cd = p.get('contract_details', {}).get('ib_contract_details')
+                raw_min_tick = cd.minTick if cd else "N/A"
+                self.log_message.emit(f"Symbol: {p['symbol']} | API minTick: {raw_min_tick}")
             
             # --- Stage 3: Calculations (ATR, Stops, Risk) ---
             contract_details_map = {p['symbol']: p['contract_details'] for p in enriched_positions}
@@ -306,7 +313,7 @@ class ATRWindow(QMainWindow):
         # Set a default client_id before loading settings
         self.client_id = 1000 
         self.trading_mode = "PAPER" # Default trading mode
-        self.debug_log_enabled = False # Default debug log
+        self.debug_log_enabled = True # Default debug log
         self.user_settings_file = os.path.join(USER_DATA_DIR, USER_SETTINGS_FILE)
         # Load settings, which will update client_id if it exists in the file
         self.load_user_settings()
@@ -636,14 +643,14 @@ class ATRWindow(QMainWindow):
                 new_client_id = int(dialog.client_id_edit.text())
                 if self.client_id != new_client_id:
                     self.client_id = new_client_id
-                    self.log_to_ui(f"Client ID updated to {self.client_id}. Changes will apply on next refresh.")
+                    # self.log_to_ui(f"Client ID updated to {self.client_id}. Changes will apply on next refresh.")
                     self.client_id_label.setText(f"Client ID: {self.client_id}")
 
                 # Update Trading Mode
                 new_trading_mode = dialog.trading_mode_combo.currentText()
                 if self.trading_mode != new_trading_mode:
                     self.trading_mode = new_trading_mode
-                    self.log_to_ui(f"Trading Mode set to {self.trading_mode}. Changes will apply on next refresh.")
+                    # self.log_to_ui(f"Trading Mode set to {self.trading_mode}. Changes will apply on next refresh.")
                     self.trading_mode_label.setText(f"Mode: {self.trading_mode}")
 
                 # Update Debug Log
@@ -653,7 +660,8 @@ class ATRWindow(QMainWindow):
 
                 self.save_user_settings() # Save all settings at once
             except ValueError:
-                self.log_to_ui("Invalid Client ID entered. It must be an integer.")
+                # self.log_to_ui("Invalid Client ID entered. It must be an integer.")
+                pass
     def log_to_ui(self, message):
         """Appends a message to the log view and auto-scrolls to the bottom."""
         self.log_view.append(message)
@@ -916,7 +924,7 @@ class ATRWindow(QMainWindow):
                     # Load client_id, defaulting to the pre-set value if not in file
                     self.client_id = settings.get('client_id', self.client_id)
                     self.trading_mode = settings.get('trading_mode', self.trading_mode)
-                    self.debug_log_enabled = settings.get('debug_log_enabled', False)
+                    self.debug_log_enabled = settings.get('debug_log_enabled', True)
                     # Load symbol toggles
                     self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
                     self.symbol_candle_size = settings.get('symbol_candle_size', {})
@@ -983,7 +991,7 @@ class ATRWindow(QMainWindow):
             del self.atr_history[symbol]
             self.save_atr_history()
             
-        self.log_to_ui(f"History wiped for {symbol} due to timeframe change. ATR will re-initialize.")
+        # self.log_to_ui(f"History wiped for {symbol} due to timeframe change. ATR will re-initialize.")
         
         # Refresh graph if needed
         if self.symbol_selector.currentText() == symbol:
@@ -999,7 +1007,7 @@ class ATRWindow(QMainWindow):
         if not is_enabled and symbol in self.highest_stop_losses:
             del self.highest_stop_losses[symbol]
             self.save_stop_history() # Persist the change immediately
-            self.log_to_ui(f"Ratchet for {symbol} has been reset. Its stop loss history is cleared.")
+            # self.log_to_ui(f"Ratchet for {symbol} has been reset. Its stop loss history is cleared.")
             logging.info(f"Removed {symbol} from highest_stop_losses to reset ratchet.")
 
     def populate_atr_table(self):
@@ -1197,7 +1205,7 @@ class ATRWindow(QMainWindow):
     def handle_data_error(self, error_message):
         """Slot to handle errors from the worker thread."""
         logging.error(f"Error in worker thread: {error_message}")
-        self.log_to_ui(f"Error fetching data: {error_message}")
+        # self.log_to_ui(f"Error fetching data: {error_message}")
         self.update_status(False)
 
     def process_order_results(self, results):
@@ -1231,11 +1239,11 @@ class ATRWindow(QMainWindow):
         if state == Qt.CheckState.Checked.value:
             self.send_adaptive_stops = True
             self.adaptive_stop_toggle.setText("ON")
-            self.log_to_ui(">>> Adaptive stop loss submission ENABLED <<<")
+            # self.log_to_ui(">>> Adaptive stop loss submission ENABLED <<<")
         else:
             self.send_adaptive_stops = False
             self.adaptive_stop_toggle.setText("OFF")
-            self.log_to_ui(">>> Adaptive stop loss submission DISABLED <<<")
+            # self.log_to_ui(">>> Adaptive stop loss submission DISABLED <<<")
 
     def update_status(self, connected):
         """Updates the connection status label in the UI."""
