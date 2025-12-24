@@ -128,13 +128,6 @@ class DataWorker(QObject):
             # --- Stage 2: Fetch Market Data ---
             enriched_positions = await fetch_market_data_for_positions(ib, basic_positions)
             
-            # --- Debug: Log API minTick ---
-            self.log_message.emit("--- API minTick Values ---")
-            for p in enriched_positions:
-                cd = p.get('contract_details', {}).get('ib_contract_details')
-                raw_min_tick = cd.minTick if cd else "N/A"
-                self.log_message.emit(f"Symbol: {p['symbol']} | API minTick: {raw_min_tick}")
-            
             # --- Stage 3: Calculations (ATR, Stops, Risk) ---
             contract_details_map = {p['symbol']: p['contract_details'] for p in enriched_positions}
             market_statuses = await get_market_statuses_for_all(ib, contract_details_map)
@@ -159,7 +152,8 @@ class DataWorker(QObject):
                 {}, # user_overrides is no longer used
                 self.highest_stop_losses, # Pass the direct reference, not a copy
                 atr_ratios_map,
-                market_statuses
+                market_statuses,
+                log_callback=self.log_message.emit
             )
             final_positions_data = calculator.process_positions(enriched_positions, atr_results)            
             self.data_ready.emit(final_positions_data, updated_atr_state, updated_atr_history)
