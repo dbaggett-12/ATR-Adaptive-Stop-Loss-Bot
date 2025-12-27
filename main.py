@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QWidget, QDoubleSpinBox, QTabWidget, QTextEdit, QPushButton, QHeaderView, QAbstractSpinBox,
     QLabel, QHBoxLayout, QCheckBox, QStyle
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal, QPoint
 from PyQt6.QtGui import QMovie, QColor, QIcon
 from ibkr_api import get_market_statuses_for_all, fetch_basic_positions, fetch_market_data_for_positions
 import pyqtgraph as pg
@@ -304,6 +304,62 @@ class SettingsWindow(QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
+class TitleBar(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self._drag_pos = QPoint()
+
+        self.setFixedHeight(36)
+
+        # Title Label
+        self.title_label = QLabel("ATR Adaptive Stop Bot")
+        
+        # Buttons
+        self.minimize_btn = QPushButton("–")
+        self.minimize_btn.clicked.connect(parent.showMinimized)
+        self.minimize_btn.setFixedSize(45, 36)
+
+        self.maximize_btn = QPushButton("☐")
+        self.maximize_btn.clicked.connect(self.toggle_maximize)
+        self.maximize_btn.setFixedSize(45, 36)
+
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setObjectName("close")
+        self.close_btn.clicked.connect(parent.close)
+        self.close_btn.setFixedSize(45, 36)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        layout.addWidget(self.title_label)
+        layout.addStretch()
+        layout.addWidget(self.minimize_btn)
+        layout.addWidget(self.maximize_btn)
+        layout.addWidget(self.close_btn)
+
+    def toggle_maximize(self):
+        if self.parent.isMaximized():
+            self.parent.showNormal()
+        else:
+            self.parent.showMaximized()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.MouseButton.LeftButton:
+            if not self.parent.isMaximized():
+                delta = event.globalPosition().toPoint() - self._drag_pos
+                self.parent.move(self.parent.pos() + delta)
+                self._drag_pos = event.globalPosition().toPoint()
+    
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_maximize()
+
 class ATRWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -311,6 +367,10 @@ class ATRWindow(QMainWindow):
         self.setWindowTitle("ATR Adaptive Stop Bot")
         # Icon is set in main() to ensure robust path resolution
         self.setGeometry(100, 100, 1400, 800)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.Window
+        )
 
         # Data stores
         self.positions_data = [] # This will hold the fully processed data from the worker
@@ -364,10 +424,18 @@ class ATRWindow(QMainWindow):
         self.worker_thread = None
 
         # Central widget & layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout()
-        central_widget.setLayout(layout)
+        main_container = QWidget()
+        self.setCentralWidget(main_container)
+        main_layout = QVBoxLayout(main_container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        self.title_bar = TitleBar(self)
+        main_layout.addWidget(self.title_bar)
+
+        content_widget = QWidget()
+        main_layout.addWidget(content_widget)
+        layout = QVBoxLayout(content_widget)
 
         # --- Status Bar at Top ---
         status_container = QWidget()
@@ -739,6 +807,10 @@ class ATRWindow(QMainWindow):
             border_color = "#CCCCCC"
             self.plot_pen = 'b' # Blue for light theme
             
+            title_bg = "#E0E0E0"
+            title_fg = "#000000"
+            btn_hover = "#D0D0D0"
+            
             self.atr_plot.setBackground('w')
             self.atr_plot.getAxis('bottom').setPen('k')
             self.atr_plot.getAxis('left').setPen('k')
@@ -746,6 +818,13 @@ class ATRWindow(QMainWindow):
             stylesheet = f"""
                 QMainWindow, QWidget {{ background-color: {bg_color}; color: {fg_color}; font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 10pt; }}
                 
+                /* Title Bar */
+                TitleBar {{ background-color: {title_bg}; border-bottom: 1px solid {border_color}; }}
+                TitleBar QLabel {{ color: {title_fg}; font-weight: bold; padding-left: 10px; border: none; background: transparent; }}
+                TitleBar QPushButton {{ background-color: transparent; border: none; color: {title_fg}; font-size: 12pt; }}
+                TitleBar QPushButton:hover {{ background-color: {btn_hover}; }}
+                TitleBar QPushButton#close:hover {{ background-color: #c42b1c; color: white; }}
+
                 /* Tabs */
                 QTabWidget::pane {{ border: 1px solid {border_color}; border-radius: 4px; top: -1px; }} 
                 QTabBar::tab {{ background-color: #E0E0E0; color: {fg_color}; border: 1px solid {border_color}; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; padding: 6px 12px; margin-right: 2px; }}
@@ -791,6 +870,10 @@ class ATRWindow(QMainWindow):
             input_bg = "#333333"
             border_color = "#555555"
             self.plot_pen = 'y' # Yellow for dark theme
+            
+            title_bg = "#1e1e1e"
+            title_fg = "#FFFFFF"
+            btn_hover = "#333333"
 
             self.atr_plot.setBackground('k')
             self.atr_plot.getAxis('bottom').setPen('#A9B7C6')
@@ -799,6 +882,13 @@ class ATRWindow(QMainWindow):
             stylesheet = f"""
                 QMainWindow, QWidget {{ background-color: {bg_color}; color: {fg_color}; font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 10pt; }}
                 
+                /* Title Bar */
+                TitleBar {{ background-color: {title_bg}; border-bottom: 1px solid {border_color}; }}
+                TitleBar QLabel {{ color: {title_fg}; font-weight: bold; padding-left: 10px; border: none; background: transparent; }}
+                TitleBar QPushButton {{ background-color: transparent; border: none; color: {title_fg}; font-size: 12pt; }}
+                TitleBar QPushButton:hover {{ background-color: {btn_hover}; }}
+                TitleBar QPushButton#close:hover {{ background-color: #c42b1c; color: white; }}
+
                 /* Tabs */
                 QTabWidget::pane {{ border: 1px solid {border_color}; border-radius: 4px; top: -1px; }}
                 QTabBar::tab {{ background-color: #3C3F41; color: #BBBBBB; border: 1px solid {border_color}; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; padding: 6px 12px; margin-right: 2px; }}
