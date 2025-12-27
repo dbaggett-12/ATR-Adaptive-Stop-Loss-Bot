@@ -237,6 +237,21 @@ class DataWorker(QObject):
             }
         return {'orders_to_submit': orders_to_submit, 'statuses_only': statuses_only}
 
+class LogBridge(QObject):
+    log_signal = pyqtSignal(str)
+
+class QtLogHandler(logging.Handler):
+    def __init__(self, bridge):
+        super().__init__()
+        self.bridge = bridge
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.bridge.log_signal.emit(msg)
+        except Exception:
+            self.handleError(record)
+
 class SettingsWindow(QDialog):
     """A dialog window for application settings."""
     def __init__(self, parent=None):
@@ -262,6 +277,11 @@ class SettingsWindow(QDialog):
         self.debug_log_check = QCheckBox()
         self.debug_log_check.setChecked(parent.debug_log_enabled)
         form_layout.addRow("Debug Log:", self.debug_log_check)
+
+        # Debug Full Log setting
+        self.debug_full_log_check = QCheckBox()
+        self.debug_full_log_check.setChecked(parent.debug_full_log_enabled)
+        form_layout.addRow("Debug Full Log:", self.debug_full_log_check)
 
         layout.addLayout(form_layout)
 
@@ -308,9 +328,18 @@ class ATRWindow(QMainWindow):
         self.client_id = 1000 
         self.trading_mode = "PAPER" # Default trading mode
         self.debug_log_enabled = True # Default debug log
+        self.debug_full_log_enabled = False # Default full log
+
+        # Setup Log Bridge for Full Log
+        self.log_bridge = LogBridge()
+        self.log_bridge.log_signal.connect(self.log_to_ui)
+        self.qt_log_handler = QtLogHandler(self.log_bridge)
+        self.qt_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
         self.user_settings_file = os.path.join(USER_DATA_DIR, USER_SETTINGS_FILE)
         # Load settings, which will update client_id if it exists in the file
         self.load_user_settings()
+        self.update_full_log_state()
 
         # Adaptive Stop Loss toggle state
         self.send_adaptive_stops = False
@@ -652,6 +681,11 @@ class ATRWindow(QMainWindow):
                     self.debug_log_enabled = dialog.debug_log_check.isChecked()
                     self.update_log_visibility()
 
+                # Update Debug Full Log
+                if self.debug_full_log_enabled != dialog.debug_full_log_check.isChecked():
+                    self.debug_full_log_enabled = dialog.debug_full_log_check.isChecked()
+                    self.update_full_log_state()
+
                 self.save_user_settings() # Save all settings at once
             except ValueError:
                 # self.log_to_ui("Invalid Client ID entered. It must be an integer.")
@@ -661,6 +695,15 @@ class ATRWindow(QMainWindow):
         self.log_view.append(message)
         # Ensure the view scrolls to the latest message
         self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())    
+
+    def update_full_log_state(self):
+        root_logger = logging.getLogger()
+        if self.debug_full_log_enabled:
+            if self.qt_log_handler not in root_logger.handlers:
+                root_logger.addHandler(self.qt_log_handler)
+        else:
+            if self.qt_log_handler in root_logger.handlers:
+                root_logger.removeHandler(self.qt_log_handler)
     
     def closeEvent(self, event):
         """
@@ -919,6 +962,7 @@ class ATRWindow(QMainWindow):
                     self.client_id = settings.get('client_id', self.client_id)
                     self.trading_mode = settings.get('trading_mode', self.trading_mode)
                     self.debug_log_enabled = settings.get('debug_log_enabled', True)
+                    self.debug_full_log_enabled = settings.get('debug_full_log_enabled', False)
                     # Load symbol toggles
                     self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
                     self.symbol_candle_size = settings.get('symbol_candle_size', {})
@@ -948,6 +992,7 @@ class ATRWindow(QMainWindow):
                     'client_id': self.client_id,
                     'trading_mode': self.trading_mode,
                     'debug_log_enabled': self.debug_log_enabled,
+                    'debug_full_log_enabled': self.debug_full_log_enabled,
                     'symbol_stop_enabled': self.symbol_stop_enabled,
                     'symbol_candle_size': self.symbol_candle_size,
                     'column_widths': self.column_widths,
