@@ -2,7 +2,7 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [main]  # change if your default branch is different
+    branches: [main]  # adjust if your default branch is different
   pull_request:
     branches: [main]
 
@@ -26,12 +26,20 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pyinstaller
+        pip install pyinstaller pillow
 
-    # Step 4: Build the EXE
+    # Step 4: Build the EXE with icon and extra data files
     - name: Build EXE with PyInstaller
       run: |
-        pyinstaller --onefile --name "Pace Chaser" --icon="PaceChaser.ico" main.py
+        pyinstaller --onefile \
+        --name "Pace Chaser" \
+        --icon="windows assets/PaceChaser.ico" \
+        --add-data "windows assets/mambo-ume-usume.gif;windows assets" \
+        --add-data "atr_history.json;." \
+        --add-data "user_settings.json;." \
+        --add-data "tr_history.json;." \
+        --add-data "stop_history.json;." \
+        main.py
 
     # Step 5: Upload the EXE artifact
     - name: Upload EXE artifact
