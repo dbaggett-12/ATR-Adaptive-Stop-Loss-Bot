@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QLabel, QHBoxLayout, QCheckBox, QStyle
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, pyqtSignal
-from PyQt6.QtGui import QMovie, QColor
+from PyQt6.QtGui import QMovie, QColor, QIcon
 from ibkr_api import get_market_statuses_for_all, fetch_basic_positions, fetch_market_data_for_positions
 import pyqtgraph as pg
 from ib_insync import IB
@@ -309,6 +309,7 @@ class ATRWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("ATR Adaptive Stop Bot")
+        self.setWindowIcon(QIcon(resource_path("windows assets/PaceChaser.ico")))
         self.setGeometry(100, 100, 1400, 800)
 
         # Data stores
@@ -760,6 +761,7 @@ class ATRWindow(QMainWindow):
                 QTextEdit {{ background-color: {input_bg}; color: {fg_color}; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; font-family: 'Courier New'; }}
                 QLineEdit, QComboBox, QDoubleSpinBox {{ background-color: {input_bg}; color: {fg_color}; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; }}
                 QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right; width: 20px; border-left-width: 1px; border-left-color: {border_color}; border-left-style: solid; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
+                QComboBox QAbstractItemView {{ background-color: {input_bg}; border: 1px solid {border_color}; selection-background-color: {table_alt_bg}; selection-color: {fg_color}; }}
                 QComboBox::down-arrow {{ image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 5px solid #666666; margin-top: 2px; margin-right: 2px; }}
                 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 16px; border-left: 1px solid {border_color}; background: #F0F0F0; }}
                 QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{ background: #E0E0E0; }}
@@ -777,7 +779,7 @@ class ATRWindow(QMainWindow):
 
                 /* Specific overrides */
                 QTableWidget QWidget {{ background-color: transparent; }}
-                QTableWidget QComboBox {{ margin: 2px; }}
+                QTableWidget QComboBox {{ margin: 2px; background-color: {input_bg}; }}
                 QTableWidget QDoubleSpinBox {{ margin: 2px; }}
             """
         else:
@@ -812,6 +814,7 @@ class ATRWindow(QMainWindow):
                 QTextEdit {{ background-color: {bg_color}; color: #A9B7C6; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; font-family: 'Courier New'; }}
                 QLineEdit, QComboBox, QDoubleSpinBox {{ background-color: {input_bg}; color: {fg_color}; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; }}
                 QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right; width: 20px; border-left-width: 1px; border-left-color: {border_color}; border-left-style: solid; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
+                QComboBox QAbstractItemView {{ background-color: {input_bg}; border: 1px solid {border_color}; selection-background-color: #454749; selection-color: {fg_color}; }}
                 QComboBox::down-arrow {{ image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 5px solid #AAAAAA; margin-top: 2px; margin-right: 2px; }}
                 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 16px; border-left: 1px solid {border_color}; background: #3C3F41; }}
                 QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{ background: #4C4F51; }}
@@ -1429,7 +1432,14 @@ class ATRWindow(QMainWindow):
 
 
 def main():
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "PaceChaser.App"
+        )
+
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(resource_path("windows assets/PaceChaser.ico")))
     window = ATRWindow()
     window.show()
     sys.exit(app.exec())
