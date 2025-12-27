@@ -1,8 +1,8 @@
 # calculator.py
 import logging
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
-from utils import get_point_value # Import from the new utils file
+from utils import get_point_value, get_tick_value, get_symbol_warning # Import from the new utils file
 
 class PortfolioCalculator:
     """
@@ -28,87 +28,129 @@ class PortfolioCalculator:
         if atr_value is None or current_price <= 0:
             return self.highest_stop_losses.get(symbol, 0), 'held'
 
-        raw_stop = current_price - (atr_value * atr_ratio)
-
-        contract_details = position_data.get('contract_details', {})
-        min_tick = contract_details.get('minTick')
         quantity = position_data.get('positions_held', 0)
+        contract_details = position_data.get('contract_details', {})
+        
+        if quantity > 0:
+            return self._compute_long_ratchet(symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet)
+        elif quantity < 0:
+            return self._compute_short_ratchet(symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet)
+        else:
+            return 0.0, 'held'
 
-        final_stop = float(raw_stop)
-        if min_tick and min_tick > 0 and quantity != 0:
-            raw_stop_decimal = Decimal(str(raw_stop))
+    def _round_price(self, price, contract_details, is_long, symbol=None):
+        """Rounds the price according to minTick and direction."""
+        min_tick = contract_details.get('minTick')
+
+        if min_tick and min_tick > 0:
+            price_decimal = Decimal(str(price))
             min_tick_decimal = Decimal(str(min_tick))
             
-            # Round down for long positions (SELL stop), which is conservative.
-            # For short positions (BUY stop), this also rounds "down" (e.g., 100.7 -> 100.5), 
-            # which moves the stop further from the market, also a conservative move.
-            rounding_mode = ROUND_DOWN
+            # Round down for long positions (SELL stop) to keep stop away from price (lower).
+            # Round up for short positions (BUY stop) to keep stop away from price (higher).
+            rounding_mode = ROUND_DOWN if is_long else ROUND_UP
             
-            rounded_stop_decimal = (raw_stop_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=rounding_mode) * min_tick_decimal
-            final_stop = float(rounded_stop_decimal)
-            logging.debug(f"Rounding for {symbol}: raw={raw_stop}, minTick={min_tick}, final={final_stop}")
+            rounded_decimal = (price_decimal / min_tick_decimal).quantize(Decimal('1'), rounding=rounding_mode) * min_tick_decimal
+            return float(rounded_decimal)
+        return float(price)
+
+    def _compute_long_ratchet(self, symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet):
+        raw_stop = current_price - (atr_value * atr_ratio)
+        final_stop = self._round_price(raw_stop, contract_details, is_long=True, symbol=symbol)
         
-        # Check if a ratchet value exists for this symbol.
-        # The presence of a key in highest_stop_losses indicates an active, tracked position.
-        is_new_position = symbol not in self.highest_stop_losses
-        
-        if apply_ratchet:
-            # If this is a brand new position, establish the first stop and treat it as 'new'.
-            if is_new_position:
-                self.highest_stop_losses[symbol] = final_stop
-                return final_stop, 'new'
-            
-            # If it's an existing position, apply ratcheting logic.
-            is_long = quantity > 0
-            if is_long:
-                prev_highest = self.highest_stop_losses.get(symbol, 0)
-                # New stop must be higher than previous highest
-                if final_stop > prev_highest:
-                    self.highest_stop_losses[symbol] = final_stop
-                    return final_stop, 'new'
-                else:
-                    # The calculated stop is not an improvement, so we hold the previous highest.
-                    return prev_highest, 'held'
-            else: # is_short
-                # For short positions, an "improving" stop is a lower price.
-                prev_highest_short = self.highest_stop_losses.get(symbol, float('inf'))
-                if final_stop < prev_highest_short:
-                    self.highest_stop_losses[symbol] = final_stop
-                    return final_stop, 'new'
-                else:
-                    # The calculated stop is not an improvement, so we hold the previous highest.
-                    return prev_highest_short, 'held'
-        else:
-            # If not ratcheting, it's always considered 'new' for UI feedback purposes
+        if not apply_ratchet:
             return final_stop, 'new'
+            
+        is_new_position = symbol not in self.highest_stop_losses
+        if is_new_position:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+            
+        prev_highest = self.highest_stop_losses.get(symbol, 0)
+        if final_stop > prev_highest:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+        else:
+            return prev_highest, 'held'
+
+    def _compute_short_ratchet(self, symbol, current_price, atr_value, atr_ratio, contract_details, apply_ratchet):
+        raw_stop = current_price + (atr_value * atr_ratio)
+        final_stop = self._round_price(raw_stop, contract_details, is_long=False, symbol=symbol)
+        
+        if not apply_ratchet:
+            return final_stop, 'new'
+            
+        is_new_position = symbol not in self.highest_stop_losses
+        if is_new_position:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+            
+        # For shorts, the stop moves DOWN. We want the minimum value seen so far.
+        prev_lowest = self.highest_stop_losses.get(symbol, float('inf'))
+        
+        if final_stop < prev_lowest:
+            self.highest_stop_losses[symbol] = final_stop
+            return final_stop, 'new'
+        else:
+            return prev_lowest, 'held'
 
     def calculate_risk(self, position_data, computed_stop):
         """Calculates the dollar and percentage risk for a position."""
-        risk_value = 0
-        percent_risk = 0.0
         avg_cost = position_data.get('avg_cost', 0)
         quantity = position_data.get('positions_held', 0)
+        current_price = position_data.get('current_price', 0)
 
-        if computed_stop and avg_cost > 0:
-            # Check for "NO RISK" condition (Stop is better than entry)
-            is_long = quantity > 0
-            if (is_long and computed_stop >= avg_cost) or (not is_long and computed_stop <= avg_cost):
+        # If there's no valid stop, cost, or position, there's no risk to calculate.
+        if computed_stop is None or avg_cost <= 0 or quantity == 0 or current_price <= 0:
+            return 0, 0.0
+
+        is_long = quantity > 0
+        risk_in_points = 0
+
+        if is_long:
+            # For a long position, risk exists if the stop is below the entry price.
+            if computed_stop < avg_cost:
+                risk_in_points = abs(current_price - computed_stop)
+            else:
+                # Stop is at or above entry price, so there is no risk.
+                if position_data['symbol'] == 'MCD':
+                    self.log_callback(f"MCD Risk: NO RISK (Stop {computed_stop:.4f} >= AvgCost {avg_cost:.4f})")
+                return "NO RISK", 0.0
+        else:  # is_short
+            # For a short position, risk exists if the stop is above the entry price.
+            if computed_stop > avg_cost:
+                risk_in_points = abs(current_price - computed_stop)
+            else:
+                # Stop is at or below entry price, so there is no risk.
+                if position_data['symbol'] == 'MCD':
+                    self.log_callback(f"MCD Risk: NO RISK (Stop {computed_stop:.4f} <= AvgCost {avg_cost:.4f})")
                 return "NO RISK", 0.0
 
-            risk_in_points = abs(avg_cost - computed_stop)
-            
-            point_value = get_point_value(
-                position_data['symbol'], 
-                position_data.get('contract_details', {}), 
-                position_data.get('multiplier', 1.0)
+        contract_details = position_data.get('contract_details', {})
+        min_tick = contract_details.get('minTick', 0.0)
+        if min_tick <= 0:
+            min_tick = 1.0
+
+        tick_value = get_tick_value(
+            position_data['symbol'],
+            contract_details,
+            position_data.get('multiplier', 1.0),
+            min_tick
+        )
+
+        ticks = risk_in_points / min_tick
+        risk_value = ticks * tick_value * abs(quantity)
+
+        if position_data['symbol'] == 'MCD':
+            self.log_callback(
+                f"MCD Risk Calc: Price={current_price:.4f}, Stop={computed_stop:.4f}, "
+                f"RiskPts={risk_in_points:.4f}, MinTick={min_tick}, TickVal={tick_value}, Qty={quantity} -> "
+                f"Risk$={risk_value:.2f}"
             )
-            
-            risk_value = risk_in_points * point_value * abs(quantity)
-            
-            hypothetical_account_value = 6000.0 # This could be a configurable setting
-            if hypothetical_account_value > 0:
-                percent_risk = (risk_value / hypothetical_account_value) * 100
-        
+
+        hypothetical_account_value = 6000.0  # This could be a configurable setting
+        percent_risk = (risk_value / hypothetical_account_value) * 100 if hypothetical_account_value > 0 else 0.0
+
         return risk_value, percent_risk
 
     def process_positions(self, positions_data, atr_results):
@@ -144,6 +186,7 @@ class PortfolioCalculator:
             p_data['dollar_risk'] = risk_value
             p_data['percent_risk'] = percent_risk
             p_data['status'] = "Ready" # Default status
+            p_data['warning'] = get_symbol_warning(symbol) # Attach any calculation warnings
 
             processed_data.append(p_data)
 

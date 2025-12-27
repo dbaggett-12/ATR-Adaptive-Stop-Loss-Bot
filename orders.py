@@ -159,15 +159,15 @@ async def process_stop_orders(
 
     timestamp = datetime.now().strftime("%H:%M:%S")
     # 6. Log high-level info from the main orchestrator function.
-    log_signal.emit(f"--- [{timestamp}] Submitting Stops ---")
+    # log_signal.emit(f"--- [{timestamp}] Submitting Stops ---")
 
     for symbol, data in orders_to_submit.items():
         stop_price = data['stop_price']
-        log_signal.emit(
-            f"  {symbol}: Stop = {stop_price:.4f} "
-            f"(Raw: 0x{struct.pack('>d', stop_price).hex()})"
-        )
-
+        # log_signal.emit(
+        #     f"  {symbol}: Stop = {stop_price:.4f} "
+        #     f"(Raw: 0x{struct.pack('>d', stop_price).hex()})"
+        # )
+        
     # 7. Centralize broker state refresh and create a read-only snapshot.
     await ib.reqAllOpenOrdersAsync()
     logging.info(f"Refreshed open orders. Found {len(ib.openOrders())} total open orders.")
