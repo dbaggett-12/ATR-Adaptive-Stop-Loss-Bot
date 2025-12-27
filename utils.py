@@ -87,6 +87,17 @@ CONTRACT_POINT_VALUES = {
     'MCD': 10000.0,  # Micro Canadian Dollar: 10000 CAD × $1.00 = $10000 per point
 }
 
+CONTRACT_TICK_VALUES = {
+    'MCD': 0.10,  # Micro CAD: $0.10 per tick
+}
+
+# Global store for symbol-specific warnings (e.g. fallback calculations)
+SYMBOL_WARNINGS = {}
+
+def get_symbol_warning(symbol):
+    """Returns the warning message for a symbol if one exists."""
+    return SYMBOL_WARNINGS.get(symbol)
+
 def update_contract_point_value(symbol, point_value):
     """
     Updates the CONTRACT_POINT_VALUES dictionary with a new symbol and point value
@@ -124,21 +135,38 @@ def get_point_value(symbol, contract_details, multiplier):
     
     if price_magnifier > 1 and md_size_multiplier is not None:
         point_value = float(md_size_multiplier) / price_magnifier
-        logging.warning(f"Unknown contract {symbol}. Derived point value: ${point_value:.2f} (mdSizeMultiplier={md_size_multiplier}, priceMagnifier={price_magnifier}). Consider adding to CONTRACT_POINT_VALUES.")
+        msg = f"Unknown contract. Derived point value: ${point_value:.2f} (mdSizeMultiplier={md_size_multiplier}, priceMagnifier={price_magnifier})."
+        logging.warning(f"{symbol}: {msg}")
+        SYMBOL_WARNINGS[symbol] = msg
         update_contract_point_value(symbol, point_value)
         return point_value
     
     elif md_size_multiplier is not None and md_size_multiplier > 1:
         point_value = float(md_size_multiplier)
-        logging.warning(f"Unknown contract {symbol}. Using mdSizeMultiplier as point value: ${point_value:.2f}. Consider adding to CONTRACT_POINT_VALUES.")
+        msg = f"Unknown contract. Using mdSizeMultiplier as point value: ${point_value:.2f}."
+        logging.warning(f"{symbol}: {msg}")
+        SYMBOL_WARNINGS[symbol] = msg
         update_contract_point_value(symbol, point_value)
         return point_value
     
     else:
         point_value = multiplier if multiplier > 0 else 1.0
-        logging.warning(f"Unknown contract {symbol}. Using multiplier as point value: ${point_value:.2f}. Consider adding to CONTRACT_POINT_VALUES.")
+        msg = f"Unknown contract. Using multiplier as point value: ${point_value:.2f}. Verify if correct."
+        logging.warning(f"{symbol}: {msg}")
+        SYMBOL_WARNINGS[symbol] = msg
         update_contract_point_value(symbol, point_value)
         return point_value
+
+def get_tick_value(symbol, contract_details, multiplier, min_tick):
+    """
+    Get the dollar value of a single tick (minimum fluctuation).
+    """
+    if symbol in CONTRACT_TICK_VALUES:
+        return CONTRACT_TICK_VALUES[symbol]
+    
+    # Fallback: Derive from point value
+    point_value = get_point_value(symbol, contract_details, multiplier)
+    return point_value * min_tick
 
 # --- MinTick Correction Logic ---
 

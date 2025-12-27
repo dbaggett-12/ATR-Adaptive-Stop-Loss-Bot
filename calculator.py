@@ -2,7 +2,7 @@
 import logging
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
-from utils import get_point_value # Import from the new utils file
+from utils import get_point_value, get_tick_value, get_symbol_warning # Import from the new utils file
 
 class PortfolioCalculator:
     """
@@ -126,18 +126,25 @@ class PortfolioCalculator:
                     self.log_callback(f"MCD Risk: NO RISK (Stop {computed_stop:.4f} <= AvgCost {avg_cost:.4f})")
                 return "NO RISK", 0.0
 
-        point_value = get_point_value(
+        contract_details = position_data.get('contract_details', {})
+        min_tick = contract_details.get('minTick', 0.0)
+        if min_tick <= 0:
+            min_tick = 1.0
+
+        tick_value = get_tick_value(
             position_data['symbol'],
-            position_data.get('contract_details', {}),
-            position_data.get('multiplier', 1.0)
+            contract_details,
+            position_data.get('multiplier', 1.0),
+            min_tick
         )
 
-        risk_value = risk_in_points * point_value * abs(quantity)
+        ticks = risk_in_points / min_tick
+        risk_value = ticks * tick_value * abs(quantity)
 
         if position_data['symbol'] == 'MCD':
             self.log_callback(
                 f"MCD Risk Calc: Price={current_price:.4f}, Stop={computed_stop:.4f}, "
-                f"RiskPts={risk_in_points:.4f}, PointVal={point_value}, Qty={quantity} -> "
+                f"RiskPts={risk_in_points:.4f}, MinTick={min_tick}, TickVal={tick_value}, Qty={quantity} -> "
                 f"Risk$={risk_value:.2f}"
             )
 
@@ -179,6 +186,7 @@ class PortfolioCalculator:
             p_data['dollar_risk'] = risk_value
             p_data['percent_risk'] = percent_risk
             p_data['status'] = "Ready" # Default status
+            p_data['warning'] = get_symbol_warning(symbol) # Attach any calculation warnings
 
             processed_data.append(p_data)
 
