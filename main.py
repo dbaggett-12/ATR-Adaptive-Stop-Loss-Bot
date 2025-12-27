@@ -33,8 +33,11 @@ os.makedirs(USER_DATA_DIR, exist_ok=True)
 logging.info(f"Using user data directory: {USER_DATA_DIR}")
 
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    """Get absolute path to resource, works for PyInstaller bundle and dev"""
+    try:
+        base_path = sys._MEIPASS  # PyInstaller temporary folder
+    except AttributeError:
+        base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
 USER_SETTINGS_FILE = "user_settings.json"
@@ -257,7 +260,7 @@ class SettingsWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(400)
 
         # Main layout
         layout = QVBoxLayout(self)
@@ -269,6 +272,8 @@ class SettingsWindow(QDialog):
 
         # Trading Mode setting
         self.trading_mode_combo = QComboBox()
+        self.trading_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.trading_mode_combo.setMinimumWidth(150)
         self.trading_mode_combo.addItems(["PAPER", "LIVE"])
         self.trading_mode_combo.setCurrentText(parent.trading_mode)
         form_layout.addRow("Trading Mode:", self.trading_mode_combo)
@@ -282,6 +287,14 @@ class SettingsWindow(QDialog):
         self.debug_full_log_check = QCheckBox()
         self.debug_full_log_check.setChecked(parent.debug_full_log_enabled)
         form_layout.addRow("Debug Full Log:", self.debug_full_log_check)
+
+        # Theme setting
+        self.theme_combo = QComboBox()
+        self.theme_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.theme_combo.setMinimumWidth(150)
+        self.theme_combo.addItems(["Dark", "Light"])
+        self.theme_combo.setCurrentText(parent.theme)
+        form_layout.addRow("Theme:", self.theme_combo)
 
         layout.addLayout(form_layout)
 
@@ -329,6 +342,7 @@ class ATRWindow(QMainWindow):
         self.trading_mode = "PAPER" # Default trading mode
         self.debug_log_enabled = True # Default debug log
         self.debug_full_log_enabled = False # Default full log
+        self.theme = "Dark" # Default theme
 
         # Setup Log Bridge for Full Log
         self.log_bridge = LogBridge()
@@ -451,8 +465,7 @@ class ATRWindow(QMainWindow):
         layout.addWidget(self.log_label)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        # A simple dark theme for the log view
-        self.log_view.setStyleSheet("background-color: #2B2B2B; color: #A9B7C6; font-family: 'Courier New';")
+        # Stylesheet is now handled by apply_theme()
         self.log_view.setMaximumHeight(200) # Give it a fixed max height
         layout.addWidget(self.log_view)
 
@@ -467,7 +480,7 @@ class ATRWindow(QMainWindow):
 
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet("QTableWidget { background-color: black; alternate-background-color: #111111; }")
+        # Stylesheet is now handled by apply_theme()
         self.table.setColumnCount(14)
         self.table.setHorizontalHeaderLabels([
             "Send", "Position", "Candle", "ATR", "ATR Ratio", "Positions Held", "Margin", "Avg Cost",
@@ -547,6 +560,7 @@ class ATRWindow(QMainWindow):
         self.refresh_timer.timeout.connect(self.start_full_refresh)
         self.refresh_timer.start(60000)  # Refresh every 60 seconds
         
+        self.apply_theme()
         # Fetch data immediately on startup
         self.start_full_refresh()
 
@@ -650,7 +664,9 @@ class ATRWindow(QMainWindow):
             axis.setTickSpacing(3600 * 4, 3600)
 
         self.atr_plot.plotItem.setAxisItems({'bottom': axis})
-        self.atr_plot.plot(x_data, y_data, pen=pg.mkPen('y', width=2), symbol='o', symbolBrush='y', symbolSize=5)
+        
+        pen_color = getattr(self, 'plot_pen', 'y')
+        self.atr_plot.plot(x_data, y_data, pen=pg.mkPen(pen_color, width=2), symbol='o', symbolBrush=pen_color, symbolSize=5)
 
     def update_log_visibility(self):
         """Updates the visibility of the log view based on the setting."""
@@ -685,6 +701,11 @@ class ATRWindow(QMainWindow):
                 if self.debug_full_log_enabled != dialog.debug_full_log_check.isChecked():
                     self.debug_full_log_enabled = dialog.debug_full_log_check.isChecked()
                     self.update_full_log_state()
+                
+                # Update Theme
+                if self.theme != dialog.theme_combo.currentText():
+                    self.theme = dialog.theme_combo.currentText()
+                    self.apply_theme()
 
                 self.save_user_settings() # Save all settings at once
             except ValueError:
@@ -705,6 +726,117 @@ class ATRWindow(QMainWindow):
             if self.qt_log_handler in root_logger.handlers:
                 root_logger.removeHandler(self.qt_log_handler)
     
+    def apply_theme(self):
+        """Applies the selected theme (Light/Dark) to the application."""
+        if self.theme == "Light":
+            # Light Theme
+            bg_color = "#F9F9F9" # Tasteful off-white
+            fg_color = "#000000"
+            table_bg = "#FFFFFF"
+            table_alt_bg = "#F0F0F0"
+            input_bg = "#FFFFFF"
+            border_color = "#CCCCCC"
+            self.plot_pen = 'b' # Blue for light theme
+            
+            self.atr_plot.setBackground('w')
+            self.atr_plot.getAxis('bottom').setPen('k')
+            self.atr_plot.getAxis('left').setPen('k')
+
+            stylesheet = f"""
+                QMainWindow, QWidget {{ background-color: {bg_color}; color: {fg_color}; font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 10pt; }}
+                
+                /* Tabs */
+                QTabWidget::pane {{ border: 1px solid {border_color}; border-radius: 4px; top: -1px; }} 
+                QTabBar::tab {{ background-color: #E0E0E0; color: {fg_color}; border: 1px solid {border_color}; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; padding: 6px 12px; margin-right: 2px; }}
+                QTabBar::tab:selected {{ background-color: {table_bg}; font-weight: bold; border-bottom: 1px solid {table_bg}; }}
+                QTabBar::tab:hover {{ background-color: #EEEEEE; }}
+
+                /* Table */
+                QTableWidget {{ background-color: {table_bg}; alternate-background-color: {table_alt_bg}; color: {fg_color}; gridline-color: {border_color}; border: 1px solid {border_color}; border-radius: 4px; }}
+                QHeaderView::section {{ background-color: #E8E8E8; color: {fg_color}; border: 1px solid #D0D0D0; padding: 4px; font-weight: bold; }}
+                QTableCornerButton::section {{ background-color: #E8E8E8; border: 1px solid #D0D0D0; }}
+                
+                /* Inputs & Combos */
+                QTextEdit {{ background-color: {input_bg}; color: {fg_color}; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; font-family: 'Courier New'; }}
+                QLineEdit, QComboBox, QDoubleSpinBox {{ background-color: {input_bg}; color: {fg_color}; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; }}
+                QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right; width: 20px; border-left-width: 1px; border-left-color: {border_color}; border-left-style: solid; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
+                QComboBox::down-arrow {{ image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 5px solid #666666; margin-top: 2px; margin-right: 2px; }}
+                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 16px; border-left: 1px solid {border_color}; background: #F0F0F0; }}
+                QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{ background: #E0E0E0; }}
+                
+                /* Buttons */
+                QPushButton {{ background-color: #FFFFFF; border: 1px solid {border_color}; border-radius: 4px; padding: 6px 12px; min-width: 60px; }}
+                QPushButton:hover {{ background-color: #F0F0F0; border-color: #BBBBBB; }}
+                QPushButton:pressed {{ background-color: #E0E0E0; border-color: #AAAAAA; }}
+                
+                /* Scrollbars */
+                QScrollBar:vertical {{ border: none; background: #F0F0F0; width: 10px; margin: 0px; border-radius: 5px; }}
+                QScrollBar::handle:vertical {{ background: #C0C0C0; min-height: 20px; border-radius: 5px; }}
+                QScrollBar::handle:vertical:hover {{ background: #A0A0A0; }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+
+                /* Specific overrides */
+                QTableWidget QWidget {{ background-color: transparent; }}
+                QTableWidget QComboBox {{ margin: 2px; }}
+                QTableWidget QDoubleSpinBox {{ margin: 2px; }}
+            """
+        else:
+            # Dark Theme
+            bg_color = "#2B2B2B"
+            fg_color = "#FFFFFF"
+            table_bg = "#000000"
+            table_alt_bg = "#111111"
+            input_bg = "#333333"
+            border_color = "#555555"
+            self.plot_pen = 'y' # Yellow for dark theme
+
+            self.atr_plot.setBackground('k')
+            self.atr_plot.getAxis('bottom').setPen('#A9B7C6')
+            self.atr_plot.getAxis('left').setPen('#A9B7C6')
+
+            stylesheet = f"""
+                QMainWindow, QWidget {{ background-color: {bg_color}; color: {fg_color}; font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 10pt; }}
+                
+                /* Tabs */
+                QTabWidget::pane {{ border: 1px solid {border_color}; border-radius: 4px; top: -1px; }}
+                QTabBar::tab {{ background-color: #3C3F41; color: #BBBBBB; border: 1px solid {border_color}; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; padding: 6px 12px; margin-right: 2px; }}
+                QTabBar::tab:selected {{ background-color: {bg_color}; color: {fg_color}; font-weight: bold; border-bottom: 1px solid {bg_color}; }}
+                QTabBar::tab:hover {{ background-color: #454749; }}
+
+                /* Table */
+                QTableWidget {{ background-color: {table_bg}; alternate-background-color: {table_alt_bg}; color: {fg_color}; gridline-color: #333333; border: 1px solid {border_color}; border-radius: 4px; }}
+                QHeaderView::section {{ background-color: #333333; color: {fg_color}; border: 1px solid {border_color}; padding: 4px; font-weight: bold; }}
+                QTableCornerButton::section {{ background-color: #333333; border: 1px solid {border_color}; }}
+                
+                /* Inputs & Combos */
+                QTextEdit {{ background-color: {bg_color}; color: #A9B7C6; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; font-family: 'Courier New'; }}
+                QLineEdit, QComboBox, QDoubleSpinBox {{ background-color: {input_bg}; color: {fg_color}; border: 1px solid {border_color}; border-radius: 4px; padding: 4px; }}
+                QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right; width: 20px; border-left-width: 1px; border-left-color: {border_color}; border-left-style: solid; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
+                QComboBox::down-arrow {{ image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 5px solid #AAAAAA; margin-top: 2px; margin-right: 2px; }}
+                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 16px; border-left: 1px solid {border_color}; background: #3C3F41; }}
+                QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{ background: #4C4F51; }}
+                
+                /* Buttons */
+                QPushButton {{ background-color: #3C3F41; border: 1px solid {border_color}; border-radius: 4px; padding: 6px 12px; min-width: 60px; color: {fg_color}; }}
+                QPushButton:hover {{ background-color: #4C4F51; border-color: #666666; }}
+                QPushButton:pressed {{ background-color: #2D2F31; border-color: #444444; }}
+                
+                /* Scrollbars */
+                QScrollBar:vertical {{ border: none; background: {bg_color}; width: 10px; margin: 0px; border-radius: 5px; }}
+                QScrollBar::handle:vertical {{ background: #555555; min-height: 20px; border-radius: 5px; }}
+                QScrollBar::handle:vertical:hover {{ background: #666666; }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+
+                /* Specific overrides */
+                QTableWidget QWidget {{ background-color: transparent; }}
+                QTableWidget QComboBox {{ margin: 2px; background-color: {input_bg}; }}
+                QTableWidget QDoubleSpinBox {{ margin: 2px; }}
+            """
+        self.setStyleSheet(stylesheet)
+        
+        if self.symbol_selector.currentText():
+            self.update_atr_graph()
+
     def closeEvent(self, event):
         """
         Overrides the default close event to ensure background threads are
@@ -963,6 +1095,7 @@ class ATRWindow(QMainWindow):
                     self.trading_mode = settings.get('trading_mode', self.trading_mode)
                     self.debug_log_enabled = settings.get('debug_log_enabled', True)
                     self.debug_full_log_enabled = settings.get('debug_full_log_enabled', False)
+                    self.theme = settings.get('theme', self.theme)
                     # Load symbol toggles
                     self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
                     self.symbol_candle_size = settings.get('symbol_candle_size', {})
@@ -993,6 +1126,7 @@ class ATRWindow(QMainWindow):
                     'trading_mode': self.trading_mode,
                     'debug_log_enabled': self.debug_log_enabled,
                     'debug_full_log_enabled': self.debug_full_log_enabled,
+                    'theme': self.theme,
                     'symbol_stop_enabled': self.symbol_stop_enabled,
                     'symbol_candle_size': self.symbol_candle_size,
                     'column_widths': self.column_widths,
