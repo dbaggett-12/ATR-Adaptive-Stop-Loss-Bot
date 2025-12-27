@@ -309,7 +309,7 @@ class ATRWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("ATR Adaptive Stop Bot")
-        self.setWindowIcon(QIcon(resource_path(os.path.join("windows assets", "PaceChaser.ico"))))
+        # Icon is set in main() to ensure robust path resolution
         self.setGeometry(100, 100, 1400, 800)
 
         # Data stores
@@ -1440,12 +1440,22 @@ def main():
 
     app = QApplication(sys.argv)
     
-    icon_path = resource_path(os.path.join("windows assets", "PaceChaser.ico"))
+    # Robust icon loading with fallback
+    icon_name = "PaceChaser.ico"
+    icon_path = resource_path(os.path.join("windows assets", icon_name))
+    
+    # Fallback: Check root directory if not found in subfolder (common in frozen builds)
     if not os.path.exists(icon_path):
-        logging.warning(f"Icon file not found at: {icon_path}")
+        fallback_path = resource_path(icon_name)
+        if os.path.exists(fallback_path):
+            icon_path = fallback_path
+        else:
+            logging.warning(f"Icon file not found at: {icon_path} or {fallback_path}")
 
-    app.setWindowIcon(QIcon(icon_path))
+    app_icon = QIcon(icon_path)
+    app.setWindowIcon(app_icon)
     window = ATRWindow()
+    window.setWindowIcon(app_icon) # Explicitly set on window as well
     window.show()
     sys.exit(app.exec())
 
