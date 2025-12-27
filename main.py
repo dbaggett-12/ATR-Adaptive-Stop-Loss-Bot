@@ -37,7 +37,7 @@ def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS  # PyInstaller temporary folder
     except AttributeError:
-        base_path = os.path.abspath(".")
+        base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
 USER_SETTINGS_FILE = "user_settings.json"
@@ -309,7 +309,7 @@ class ATRWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("ATR Adaptive Stop Bot")
-        self.setWindowIcon(QIcon(resource_path("windows assets/PaceChaser.ico")))
+        self.setWindowIcon(QIcon(resource_path(os.path.join("windows assets", "PaceChaser.ico"))))
         self.setGeometry(100, 100, 1400, 800)
 
         # Data stores
@@ -1439,7 +1439,12 @@ def main():
         )
 
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(resource_path("windows assets/PaceChaser.ico")))
+    
+    icon_path = resource_path(os.path.join("windows assets", "PaceChaser.ico"))
+    if not os.path.exists(icon_path):
+        logging.warning(f"Icon file not found at: {icon_path}")
+
+    app.setWindowIcon(QIcon(icon_path))
     window = ATRWindow()
     window.show()
     sys.exit(app.exec())
