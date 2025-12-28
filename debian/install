@@ -1,0 +1,28 @@
+# Install the main Python script as the executable
+atrTrailingStop/main.py                  usr/bin/pacechaser
+
+# Install required Python modules
+atrTrailingStop/utils.py                 usr/share/pacechaser/
+atrTrailingStop/orders.py                usr/share/pacechaser/
+atrTrailingStop/ibkr_api.py              usr/share/pacechaser/
+atrTrailingStop/calculator.py            usr/share/pacechaser/
+atrTrailingStop/atr_processor.py         usr/share/pacechaser/
+
+# Install JSON data files
+atrTrailingStop/user_settings.json       usr/share/pacechaser/
+atrTrailingStop/tr_history.json          usr/share/pacechaser/
+atrTrailingStop/stop_history.json        usr/share/pacechaser/
+atrTrailingStop/atr_history.json         usr/share/pacechaser/
+
+# Install icons
+atrTrailingStop/linux_assets/assets/icons/hicolor/16x16/apps/PaceChaser.png   usr/share/icons/hicolor/16x16/apps/
+atrTrailingStop/linux_assets/assets/icons/hicolor/24x24/apps/PaceChaser.png   usr/share/icons/hicolor/24x24/apps/
+atrTrailingStop/linux_assets/assets/icons/hicolor/32x32/apps/PaceChaser.png   usr/share/icons/hicolor/32x32/apps/
+atrTrailingStop/linux_assets/assets/icons/hicolor/48x48/apps/PaceChaser.png   usr/share/icons/hicolor/48x48/apps/
+atrTrailingStop/linux_assets/assets/icons/hicolor/64x64/apps/PaceChaser.png   usr/share/icons/hicolor/64x64/apps/
+atrTrailingStop/linux_assets/assets/icons/hicolor/128x128/apps/PaceChaser.png  usr/share/icons/hicolor/128x128/apps/
+atrTrailingStop/linux_assets/assets/icons/hicolor/256x256/apps/PaceChaser.png  usr/share/icons/hicolor/256x256/apps/
+atrTrailingStop/linux_assets/assets/icons/hicolor/512x512/apps/PaceChaser.png  usr/share/icons/hicolor/512x512/apps/
+
+# Install the .desktop launcher
+atrTrailingStop/linux_assets/PaceChaser.desktop     usr/share/applications/
