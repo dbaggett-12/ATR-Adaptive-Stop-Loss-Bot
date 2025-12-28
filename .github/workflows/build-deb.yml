@@ -45,7 +45,7 @@ jobs:
       - name: Build Debian package
         run: |
           dpkg-buildpackage -us -uc -b
-          mv ../*.deb .  # move the DEB into workspace for artifact upload
+          mv ../*.deb .  # move DEB into workspace for artifact upload
 
       - name: Run lintian (non-fatal)
         run: |
@@ -55,4 +55,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pacechaser-deb
-          path: *.deb
+          path: "*.deb"
