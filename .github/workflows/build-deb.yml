@@ -33,7 +33,8 @@ jobs:
             python3-all \
             python3-pip \
             python3-setuptools \
-            python3-wheel
+            python3-wheel \
+            debhelper-compat
 
       - name: Install Python dependencies
         run: |
@@ -44,13 +45,14 @@ jobs:
       - name: Build Debian package
         run: |
           dpkg-buildpackage -us -uc -b
+          mv ../*.deb .  # move the DEB into workspace for artifact upload
 
       - name: Run lintian (non-fatal)
         run: |
-          lintian ../*.deb || true
+          lintian *.deb || true
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
           name: pacechaser-deb
-          path: ../*.deb
+          path: *.deb
