@@ -1,5 +1,6 @@
 # main.py
 import sys
+sys.path.append("/usr/share/pacechaser/")
 import logging
 import threading
 import random

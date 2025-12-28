@@ -12,14 +12,17 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Set up Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # 3. Install system build dependencies
       - name: Install system build dependencies
         run: |
           sudo apt-get update
@@ -33,26 +36,31 @@ jobs:
             python3-all \
             python3-pip \
             python3-setuptools \
-            python3-wheel \
-            debhelper-compat
+            python3-wheel
 
+      # 4. Install Python dependencies
       - name: Install Python dependencies
         run: |
           python3 -m pip install --upgrade pip
           pip install --upgrade setuptools wheel
           pip install -r requirements.txt
 
+      # 5. Make main.py executable
+      - name: Make main.py executable
+        run: chmod +x main.py
+
+      # 6. Build Debian package
       - name: Build Debian package
         run: |
           dpkg-buildpackage -us -uc -b
-          mv ../*.deb .  # move DEB into workspace for artifact upload
 
-      - name: Run lintian (non-fatal)
-        run: |
-          lintian *.deb || true
+      # 7. Run lintian (non-fatal)
+      - name: Run lintian
+        run: lintian ../*.deb || true
 
+      # 8. Upload DEB artifact
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
           name: pacechaser-deb
-          path: "*.deb"
+          path: ../*.deb
