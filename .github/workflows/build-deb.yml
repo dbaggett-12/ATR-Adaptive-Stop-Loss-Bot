@@ -49,18 +49,20 @@ jobs:
       - name: Make main.py executable
         run: chmod +x main.py
 
-      # 6. Build Debian package
+      # 6. Build Debian package and move it into workspace
       - name: Build Debian package
         run: |
           dpkg-buildpackage -us -uc -b
+          # Move the generated DEB into workspace
+          mv ../*.deb .
 
       # 7. Run lintian (non-fatal)
       - name: Run lintian
-        run: lintian ../*.deb || true
+        run: lintian *.deb || true
 
       # 8. Upload DEB artifact
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
           name: pacechaser-deb
-          path: ../*.deb
+          path: '*.deb'
