@@ -1,0 +1,14 @@
+Source: pacechaser
+Section: utils
+Priority: optional
+Maintainer: David <d.baggett12@gmail.com>
+Build-Depends: debhelper (>= 12), python3-all
+Standards-Version: 4.5.0
+Homepage: https://github.com/dbaggett-12/ATR-Adaptive-Stop-Loss-Bot
+
+Package: pacechaser
+Architecture: all
+Depends: python3, ${misc:Depends}, ${python3:Depends}
+Description: Pace Chaser Python application
+ A high-level description of Pace Chaser goes here.
+ Multi-line descriptions are supported; each continuation line must start with a space.

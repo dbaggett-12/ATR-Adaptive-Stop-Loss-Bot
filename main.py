@@ -412,12 +412,12 @@ class ATRWindow(QMainWindow):
         self.qt_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
         self.user_settings_file = os.path.join(USER_DATA_DIR, USER_SETTINGS_FILE)
+        # Adaptive Stop Loss toggle state default
+        self.send_adaptive_stops = False
         # Load settings, which will update client_id if it exists in the file
         self.load_user_settings()
         self.update_full_log_state()
 
-        # Adaptive Stop Loss toggle state
-        self.send_adaptive_stops = False
         self.market_statuses = {}  # {symbol: 'ACTIVE (RTH)' | 'ACTIVE (NT)' | 'CLOSED'}
 
         # Threading
@@ -456,9 +456,9 @@ class ATRWindow(QMainWindow):
         toggle_label.setStyleSheet("font-weight: bold;")
         toggle_hbox.addWidget(toggle_label)
         self.adaptive_stop_toggle = QCheckBox()
-        self.adaptive_stop_toggle.setChecked(False)
+        self.adaptive_stop_toggle.setChecked(self.send_adaptive_stops)
         self.adaptive_stop_toggle.stateChanged.connect(self.on_adaptive_stop_toggled)
-        self.adaptive_stop_toggle.setText("OFF")
+        self.adaptive_stop_toggle.setText("ON" if self.send_adaptive_stops else "OFF")
         toggle_hbox.addWidget(self.adaptive_stop_toggle)
         left_status_layout.addWidget(toggle_widget)
 
@@ -1189,6 +1189,7 @@ class ATRWindow(QMainWindow):
                     self.debug_log_enabled = settings.get('debug_log_enabled', True)
                     self.debug_full_log_enabled = settings.get('debug_full_log_enabled', False)
                     self.theme = settings.get('theme', self.theme)
+                    self.send_adaptive_stops = settings.get('send_adaptive_stops', False)
                     # Load symbol toggles
                     self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
                     self.symbol_candle_size = settings.get('symbol_candle_size', {})
@@ -1220,6 +1221,7 @@ class ATRWindow(QMainWindow):
                     'debug_log_enabled': self.debug_log_enabled,
                     'debug_full_log_enabled': self.debug_full_log_enabled,
                     'theme': self.theme,
+                    'send_adaptive_stops': self.send_adaptive_stops,
                     'symbol_stop_enabled': self.symbol_stop_enabled,
                     'symbol_candle_size': self.symbol_candle_size,
                     'column_widths': self.column_widths,
@@ -1510,6 +1512,7 @@ class ATRWindow(QMainWindow):
             self.send_adaptive_stops = False
             self.adaptive_stop_toggle.setText("OFF")
             # self.log_to_ui(">>> Adaptive stop loss submission DISABLED <<<")
+        self.save_user_settings()
 
     def update_status(self, connected):
         """Updates the connection status label in the UI."""
