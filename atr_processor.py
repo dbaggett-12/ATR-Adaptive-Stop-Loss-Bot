@@ -1,7 +1,8 @@
 # atr_processor.py
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from ib_insync import IB, util, Contract
 import json
 import pandas as pd
@@ -60,8 +61,8 @@ class ATRProcessor:
         """
         Removes symbols no longer in the portfolio and old TR data from the state.
         """
-        tr_cutoff_date = datetime.now() - timedelta(days=100)
-        atr_cutoff_date = datetime.now() - timedelta(days=3)
+        tr_cutoff_date = datetime.now(ZoneInfo("UTC")) - timedelta(days=100)
+        atr_cutoff_date = datetime.now(ZoneInfo("UTC")) - timedelta(days=3)
 
         # Use a list of keys to iterate, allowing safe deletion from the dictionary
         for symbol in list(self.atr_state.keys()):
@@ -111,7 +112,7 @@ class ATRProcessor:
                         # Timestamps are stored as ISO 8601 strings with timezone
                         timestamp_dt = datetime.fromisoformat(timestamp_str)
                         # Handle both aware and naive timestamps (Daily bars are often naive)
-                        cutoff_cmp = tr_cutoff_date.astimezone() if timestamp_dt.tzinfo else tr_cutoff_date
+                        cutoff_cmp = tr_cutoff_date if timestamp_dt.tzinfo else tr_cutoff_date.replace(tzinfo=None)
                         if timestamp_dt < cutoff_cmp:
                             timestamps_to_remove.append(timestamp_str)
                     except (ValueError, TypeError):
@@ -149,7 +150,7 @@ class ATRProcessor:
                 for timestamp_str in symbol_atr_candle_history:
                     try:
                         timestamp_dt = datetime.fromisoformat(timestamp_str)
-                        cutoff_cmp = atr_cutoff_date.astimezone() if timestamp_dt.tzinfo else atr_cutoff_date
+                        cutoff_cmp = atr_cutoff_date if timestamp_dt.tzinfo else atr_cutoff_date.replace(tzinfo=None)
                         if timestamp_dt < cutoff_cmp:
                             timestamps_to_remove.append(timestamp_str)
                     except (ValueError, TypeError):
