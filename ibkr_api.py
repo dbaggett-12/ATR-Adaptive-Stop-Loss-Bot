@@ -4,7 +4,7 @@ import asyncio
 import random
 from datetime import datetime
 import logging
-import pytz
+from zoneinfo import ZoneInfo
 import math
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from utils import get_point_value, get_corrected_min_tick
@@ -280,7 +280,7 @@ async def get_market_statuses_for_all(ib: IB, contracts_info: dict) -> dict:
     Returns:
         dict: A dictionary mapping symbol to its detailed market status.
     """
-    now_utc = datetime.now(pytz.utc)
+    now_utc = datetime.now(ZoneInfo("UTC"))
 
     async def check_status(symbol, details):
         # Optimization: Use cached ContractDetails if available from fetch_market_data_for_positions
