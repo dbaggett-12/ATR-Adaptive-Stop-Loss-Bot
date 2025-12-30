@@ -88,7 +88,7 @@ CONTRACT_POINT_VALUES = {
 }
 
 CONTRACT_TICK_VALUES = {
-    'MCD': 0.10,  # Micro CAD: $0.10 per tick
+    # 'MCD': 0.10,  # Removed: Calculated dynamically as point_value * min_tick (10000 * 0.0001 = 1.00)
 }
 
 # Global store for symbol-specific warnings (e.g. fallback calculations)
@@ -165,6 +165,8 @@ def get_tick_value(symbol, contract_details, multiplier, min_tick):
         return CONTRACT_TICK_VALUES[symbol]
     
     # Fallback: Derive from point value
+    # Formula: tick_value = contract_point_value * (min_tick / true_contract_tick)
+    # Since CONTRACT_POINT_VALUES are defined per 1.0 move, true_contract_tick is 1.0.
     point_value = get_point_value(symbol, contract_details, multiplier)
     return point_value * min_tick
 
