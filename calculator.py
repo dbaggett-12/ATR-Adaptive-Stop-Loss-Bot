@@ -112,8 +112,6 @@ class PortfolioCalculator:
                 risk_in_points = avg_cost - computed_stop
             else:
                 # Stop is at or above entry price, so there is no risk.
-                if position_data['symbol'] == 'MCD':
-                    self.log_callback(f"MCD Risk: NO RISK (Stop {computed_stop:.4f} >= AvgCost {avg_cost:.4f})")
                 return "NO RISK", 0.0
         else:  # is_short
             # For a short position, risk exists if the stop is above the entry price.
@@ -121,8 +119,6 @@ class PortfolioCalculator:
                 risk_in_points = computed_stop - avg_cost
             else:
                 # Stop is at or below entry price, so there is no risk.
-                if position_data['symbol'] == 'MCD':
-                    self.log_callback(f"MCD Risk: NO RISK (Stop {computed_stop:.4f} <= AvgCost {avg_cost:.4f})")
                 return "NO RISK", 0.0
 
         contract_details = position_data.get('contract_details', {})
@@ -137,17 +133,17 @@ class PortfolioCalculator:
             min_tick
         )
 
+        # Adjust tick_value for price magnifier if present.
+        # The avg_cost and computed_stop are normalized (magnified), so the point value
+        # derived from the raw multiplier needs to be scaled down to match.
+        price_magnifier = contract_details.get('priceMagnifier', 1)
+        if price_magnifier > 1:
+            tick_value /= price_magnifier
+
         # Calculate total risk value:
         # Risk = (Points Risk / MinTick) * Tick Value * Quantity
         ticks = risk_in_points / min_tick
         risk_value = ticks * tick_value * abs(quantity)
-
-        if position_data['symbol'] == 'MCD':
-            self.log_callback(
-                f"MCD Risk Calc: AvgCost={avg_cost:.4f}, Stop={computed_stop:.4f}, "
-                f"RiskPts={risk_in_points:.4f}, MinTick={min_tick}, TickVal={tick_value}, Qty={quantity} -> "
-                f"Risk$={risk_value:.2f}"
-            )
 
         hypothetical_account_value = 6000.0  # This could be a configurable setting
         percent_risk = (risk_value / hypothetical_account_value) * 100 if hypothetical_account_value > 0 else 0.0

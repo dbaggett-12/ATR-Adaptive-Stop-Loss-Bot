@@ -499,6 +499,12 @@ async def fetch_market_data_for_positions(ib: IB, positions_data: List[Dict]) ->
             
             # Capture the price magnifier, which is crucial for contracts priced in cents.
             p_data['contract_details']['priceMagnifier'] = int(cd.priceMagnifier) if cd.priceMagnifier else 1
+            
+            # Apply Price Magnifier to avg_cost ONLY (as requested)
+            if p_data['contract_details']['priceMagnifier'] > 1:
+                p_data['avg_cost'] *= p_data['contract_details']['priceMagnifier']
+                logging.info(f"Applied priceMagnifier {p_data['contract_details']['priceMagnifier']} to {symbol} avg_cost")
+
             # Capture the mdSizeMultiplier, which often represents the point value or contract size.
             p_data['contract_details']['mdSizeMultiplier'] = int(cd.mdSizeMultiplier) if cd.mdSizeMultiplier is not None else None
             

@@ -42,7 +42,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 USER_SETTINGS_FILE = "user_settings.json"
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 
 # --- Default Settings File Handling ---
 # This ensures a default user_settings.json is available in the user's data directory.
