@@ -14,5 +14,6 @@
     "MES": "1 day",
     "MHG": "1 hour",
     "QG": "15 mins"
-  }
+  },
+  "symbol_atr_ratio": {}
 }

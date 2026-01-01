@@ -42,7 +42,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 USER_SETTINGS_FILE = "user_settings.json"
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.6"
 
 # --- Default Settings File Handling ---
 # This ensures a default user_settings.json is available in the user's data directory.
@@ -320,6 +320,7 @@ class ATRWindow(QMainWindow):
         self.symbol_stop_enabled = {}  # {symbol: bool} to track individual stop toggles
         self.symbol_candle_size = {} # {symbol: "1 day"|"1 hour"|"15 mins"}
         self.atr_ratios = {} # {symbol: float} to store user-set ATR ratios from the UI
+        self.initial_load_complete = False # Track if initial data load is done for cleanup safety
 
         # ATR calculation data
         self.atr_symbols = []
@@ -1063,6 +1064,7 @@ class ATRWindow(QMainWindow):
 
         # 2. Trigger the recalculation for the specific row
         self.recalculate_row(row)
+        self.save_user_settings() # Save changes immediately
 
     def recalculate_row(self, row):
         """
@@ -1128,20 +1130,42 @@ class ATRWindow(QMainWindow):
                     # Load symbol toggles
                     self.symbol_stop_enabled = settings.get('symbol_stop_enabled', {})
                     self.symbol_candle_size = settings.get('symbol_candle_size', {})
+                    self.atr_ratios = settings.get('symbol_atr_ratio', {})
                     self.column_widths = settings.get('column_widths', {})
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Error loading user settings: {e}")
                 self.symbol_stop_enabled = {}
                 self.symbol_candle_size = {}
+                self.atr_ratios = {}
                 self.column_widths = {}
         else:
             self.symbol_stop_enabled = {}
             self.symbol_candle_size = {}
+            self.atr_ratios = {}
             self.column_widths = {}
 
     def save_user_settings(self):
         """Save all user settings to user_settings.json"""
         try:
+            # Cleanup logic: Remove settings for symbols no longer in the portfolio
+            if self.initial_load_complete:
+                current_symbols = set(p['symbol'] for p in self.positions_data)
+                
+                for symbol in list(self.symbol_stop_enabled.keys()):
+                    if symbol not in current_symbols:
+                        del self.symbol_stop_enabled[symbol]
+                        logging.info(f"Removed symbol_stop_enabled for {symbol} as it is no longer in the portfolio.")
+                
+                for symbol in list(self.symbol_candle_size.keys()):
+                    if symbol not in current_symbols:
+                        del self.symbol_candle_size[symbol]
+                        logging.info(f"Removed symbol_candle_size for {symbol} as it is no longer in the portfolio.")
+                        
+                for symbol in list(self.atr_ratios.keys()):
+                    if symbol not in current_symbols:
+                        del self.atr_ratios[symbol]
+                        logging.info(f"Removed symbol_atr_ratio for {symbol} as it is no longer in the portfolio.")
+
             # Capture current column widths if table exists
             if hasattr(self, 'table'):
                 current_widths = {}
@@ -1159,6 +1183,7 @@ class ATRWindow(QMainWindow):
                     'send_adaptive_stops': self.send_adaptive_stops,
                     'symbol_stop_enabled': self.symbol_stop_enabled,
                     'symbol_candle_size': self.symbol_candle_size,
+                    'symbol_atr_ratio': self.atr_ratios,
                     'column_widths': self.column_widths,
                     # Add any other settings here in the future
                 }
@@ -1376,6 +1401,7 @@ class ATRWindow(QMainWindow):
         logging.info(f"Main window ATR history updated with {len(self.atr_history)} symbols.")
 
         self.positions_data = positions_data
+        self.initial_load_complete = True
 
         # Update ATR table data from the processed positions
         self.atr_symbols = [p['symbol'] for p in self.positions_data]
